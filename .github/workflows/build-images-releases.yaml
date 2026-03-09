@@ -125,7 +125,7 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           tags: quay.io/${{ vars.QUAY_ORGANIZATION }}/ztunnel:${{ github.ref_name }}${{ matrix.tag_suffix }}
-          build-args: BASE_IMAGE=gcr.io/distroless/cc-debian12:nonroot
+          build-args: BASE_IMAGE=gcr.io/distroless/cc-debian13:nonroot
 
   create-release:
     name: Create GitHub Release
