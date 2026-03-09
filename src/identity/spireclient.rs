@@ -238,7 +238,10 @@ impl<C: DelegatedIdentityApi> SpireClient<C> {
             Ok(Ok(response)) => Ok(response),
             Ok(Err(e)) => Err(e),
             Err(_) => {
-                tracing::error!("Timeout while waiting for SPIRE SVID (stream establishment or reading took longer than {:?})", time_out);
+                tracing::error!(
+                    "Timeout while waiting for SPIRE SVID (stream establishment or reading took longer than {:?})",
+                    time_out
+                );
                 Err(Error::FailedToFetchCertificate(
                     "Timeout while waiting for SVID stream".to_string(),
                 ))
