@@ -79,6 +79,7 @@ const HTTP2_FRAME_SIZE: &str = "HTTP2_FRAME_SIZE";
 const UNSTABLE_ENABLE_SOCKS5: &str = "UNSTABLE_ENABLE_SOCKS5";
 
 const CRL_PATH: &str = "CRL_PATH";
+const READINESS_BIND_ADDRESS: &str = "READINESS_BIND_ADDRESS";
 
 const DEFAULT_WORKER_THREADS: u16 = 2;
 const DEFAULT_ADMIN_PORT: u16 = 15000;
@@ -786,8 +787,10 @@ pub fn construct_config(pc: ProxyConfig) -> Result<Config, Error> {
             bind_wildcard,
             pc.stats_port.unwrap_or(DEFAULT_STATS_PORT),
         )),
-        // readiness probe should only be accessible over localhost (kubelet runs on same node)
-        readiness_addr: Address::Localhost(ipv6_localhost_enabled, DEFAULT_READINESS_PORT),
+        readiness_addr: Address::SocketAddr(SocketAddr::new(
+            parse::<IpAddr>(READINESS_BIND_ADDRESS)?.unwrap_or(bind_wildcard),
+            DEFAULT_READINESS_PORT,
+        )),
 
         socks5_addr,
         inbound_addr,
@@ -1271,6 +1274,50 @@ pub mod tests {
 
         // Unsupported scheme - returns error
         assert!(validate_uri(Some("ftp://example.com".to_string())).is_err());
+    }
+
+    #[test]
+    fn test_readiness_bind_address() {
+        unsafe {
+            // Default: should bind to wildcard (0.0.0.0)
+            env::remove_var(READINESS_BIND_ADDRESS);
+        }
+        let cfg = construct_config(ProxyConfig::default()).unwrap();
+        match cfg.readiness_addr {
+            Address::SocketAddr(addr) => {
+                assert!(
+                    addr.ip() == IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+                        || addr.ip() == IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+                    "expected wildcard address, got {}",
+                    addr.ip()
+                );
+                assert_eq!(addr.port(), DEFAULT_READINESS_PORT);
+            }
+            _ => panic!("expected SocketAddr"),
+        }
+
+        // Explicit localhost
+        unsafe {
+            env::set_var(READINESS_BIND_ADDRESS, "127.0.0.1");
+        }
+        let cfg = construct_config(ProxyConfig::default()).unwrap();
+        match cfg.readiness_addr {
+            Address::SocketAddr(addr) => {
+                assert_eq!(addr.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+                assert_eq!(addr.port(), DEFAULT_READINESS_PORT);
+            }
+            _ => panic!("expected SocketAddr"),
+        }
+
+        // Invalid value should error
+        unsafe {
+            env::set_var(READINESS_BIND_ADDRESS, "not-an-ip");
+        }
+        assert!(construct_config(ProxyConfig::default()).is_err());
+
+        unsafe {
+            env::remove_var(READINESS_BIND_ADDRESS);
+        }
     }
 
     #[test]
