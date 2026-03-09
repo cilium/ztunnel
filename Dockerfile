@@ -1,9 +1,9 @@
 # Copyright Authors of Cilium
 # SPDX-License-Identifier: Apache-2.0
 
-# Base image: cc-debian12 provides glibc + libgcc_s + CA certificates.
+# Base image: cc-debian13 provides glibc >= 2.38 + libgcc_s + CA certificates.
 # Use :nonroot for production, :debug for a busybox shell.
-ARG BASE_IMAGE=gcr.io/distroless/cc-debian12:nonroot
+ARG BASE_IMAGE=gcr.io/distroless/cc-debian13:nonroot
 
 FROM ${BASE_IMAGE}
 
