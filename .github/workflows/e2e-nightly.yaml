@@ -1,0 +1,169 @@
+# Copyright Authors of Cilium
+# SPDX-License-Identifier: Apache-2.0
+
+# Nightly e2e against Cilium main. Catches upstream regressions before they
+# ship in a release. Independent from the per-PR e2e job (e2e-tests.yaml),
+# which targets the stable Cilium release.
+
+name: E2E Nightly (Cilium main)
+
+on:
+  schedule:
+    - cron: '0 6 * * *'  # 06:00 UTC daily
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CILIUM_CLI_VERSION: v0.19.1
+
+jobs:
+  wait-for-image:
+    name: Wait for CI Image
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      image: ${{ steps.image.outputs.image }}
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Compute image reference
+        id: image
+        run: |
+          SHA=$(git rev-parse HEAD)
+          IMAGE="quay.io/${{ vars.QUAY_ORGANIZATION_DEV }}/ztunnel-ci:${SHA}"
+          echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
+          echo "Waiting for image: ${IMAGE}"
+
+      - name: Wait for image to be available
+        run: |
+          for i in $(seq 1 40); do
+            if docker manifest inspect "${{ steps.image.outputs.image }}" &>/dev/null; then
+              echo "Image is available!"
+              exit 0
+            fi
+            echo "Attempt ${i}/40: Image not yet available, waiting 45s..."
+            sleep 45
+          done
+          echo "::error::Timed out waiting for CI image"
+          exit 1
+
+  e2e-test:
+    name: E2E Test (Cilium main)
+    needs: wait-for-image
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Checkout Cilium main
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: cilium/cilium
+          ref: main
+          path: cilium-src
+          fetch-depth: 1
+          persist-credentials: false
+          sparse-checkout: |
+            install
+
+      - name: Create kind cluster
+        uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1.14.0
+        with:
+          config: .github/kind-config.yaml
+          wait: 0  # Cilium is the CNI; nodes won't be Ready until it's installed
+
+      - name: Generate ztunnel TLS certificates
+        uses: ./.github/actions/ztunnel-certs
+
+      - name: Install Cilium CLI
+        uses: cilium/cilium-cli@e3a20f4df0e49da32a381e8c91748f311d404134 # v0.19.1
+        with:
+          skip-build: true
+          release-version: ${{ env.CILIUM_CLI_VERSION }}
+
+      - name: Install Cilium from main chart
+        id: install-cilium
+        run: |
+          ZTUNNEL_IMAGE="${{ needs.wait-for-image.outputs.image }}"
+          CILIUM_SHA=$(git -C cilium-src rev-parse HEAD)
+          echo "Installing Cilium main@${CILIUM_SHA} with ztunnel image: ${ZTUNNEL_IMAGE}"
+
+          cilium install \
+            --chart-directory cilium-src/install/kubernetes/cilium \
+            --wait \
+            --helm-set=image.repository=quay.io/cilium/cilium-ci \
+            --helm-set=image.tag="${CILIUM_SHA}" \
+            --helm-set=image.useDigest=false \
+            --helm-set=image.pullPolicy=Always \
+            --helm-set=operator.image.repository=quay.io/cilium/operator \
+            --helm-set=operator.image.suffix=-ci \
+            --helm-set=operator.image.tag="${CILIUM_SHA}" \
+            --helm-set=operator.image.useDigest=false \
+            --helm-set=operator.image.pullPolicy=Always \
+            --helm-set=debug.enabled=true \
+            --helm-set=encryption.enabled=true \
+            --helm-set=encryption.type=ztunnel \
+            --helm-set=encryption.ztunnel.image.override="${ZTUNNEL_IMAGE}" \
+            --helm-set=kubeProxyReplacement=true \
+            --helm-set=tunnelProtocol=vxlan
+
+          cilium status --wait --interactive=false
+          kubectl get pods --all-namespaces -o wide
+
+          ACTUAL_IMAGE=$(kubectl -n kube-system get daemonset/ztunnel-cilium \
+            -o jsonpath='{.spec.template.spec.containers[0].image}')
+          echo "Ztunnel image: ${ACTUAL_IMAGE}"
+          if [ "${ACTUAL_IMAGE}" != "${ZTUNNEL_IMAGE}" ]; then
+            echo "::error::Expected image ${ZTUNNEL_IMAGE}, got ${ACTUAL_IMAGE}"
+            exit 1
+          fi
+
+      - name: Run connectivity tests
+        id: connectivity-test
+        run: |
+          mkdir -p cilium-junits
+
+          cilium connectivity test \
+            --test="ztunnel-pod-to-pod-encryption" \
+            --include-unsafe-tests \
+            --collect-sysdump-on-failure \
+            --flow-validation=disabled \
+            --debug \
+            --sysdump-output-filename="cilium-sysdump-e2e-ztunnel-<ts>" \
+            --junit-file="cilium-junits/e2e-ztunnel.xml"
+
+      - name: Collect ztunnel logs on failure
+        if: failure() && steps.install-cilium.outcome != 'skipped'
+        run: |
+          kubectl -n kube-system describe daemonset/ztunnel-cilium | tee ztunnel-logs.txt || true
+          kubectl -n kube-system logs -l app=ztunnel-cilium --tail=1000 | tee -a ztunnel-logs.txt || true
+          # Only collect a sysdump here if the connectivity test didn't
+          # already produce one via --collect-sysdump-on-failure (which only
+          # fires when the test itself fails). Covers install / pre-test
+          # failure modes.
+          if [ "${{ steps.connectivity-test.outcome }}" != "failure" ]; then
+            cilium sysdump --output-filename "cilium-sysdump-pre-test-<ts>" || true
+          fi
+
+      - name: Upload test artifacts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: e2e-nightly-test-results
+          path: |
+            cilium-junits/
+            cilium-sysdump*.zip
+            ztunnel-logs.txt
+          retention-days: 5
