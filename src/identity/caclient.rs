@@ -225,6 +225,10 @@ pub mod mock {
     #[derive(Default)]
     struct ClientState {
         fetches: Vec<Identity>,
+        // For each fetch (in order), whether `req.workload` was supplied. Lets
+        // tests assert that the workload-keyed (SPIFFE Broker) path carries
+        // WorkloadInfo on every fetch, including background refreshes.
+        workload_present: Vec<bool>,
         error: bool,
         cert_gen: tls::mock::CertGenerator,
     }
@@ -278,6 +282,13 @@ pub mod mock {
             self.state.write().await.fetches.clear();
         }
 
+        // Returns, in order, whether each fetch carried per-workload attestation
+        // context (`req.workload`). Used to verify the SPIFFE Broker path keeps
+        // supplying WorkloadInfo across background refreshes.
+        pub async fn workload_present(&self) -> Vec<bool> {
+            self.state.read().await.workload_present.clone()
+        }
+
         async fn fetch_certificate(
             &self,
             id: &CompositeId<Identity>,
@@ -325,12 +336,22 @@ pub mod mock {
 
     #[async_trait]
     impl crate::identity::CaClientTrait for CaClient {
-        type Key = Identity;
+        type Key = crate::identity::RequestKey;
         async fn fetch_certificate(
             &self,
-            id: &CompositeId<Identity>,
+            id: &CompositeId<crate::identity::RequestKey>,
         ) -> Result<tls::WorkloadCertificate, Error> {
-            self.fetch_certificate(id).await
+            // Record whether the fetch carried per-workload attestation context.
+            // The Istio CA path uses identity-only keys; the SPIFFE Broker
+            // (workload-keyed) path must supply it on every fetch, including
+            // background refreshes.
+            self.state.write().await.workload_present.push(matches!(
+                id.key(),
+                crate::identity::RequestKey::BrokerWorkload { .. }
+            ));
+            // Mock matches the real Istio CA shape otherwise: key on identity only.
+            self.fetch_certificate(&CompositeId::with_key(id.id().clone(), id.id().clone()))
+                .await
         }
     }
 }

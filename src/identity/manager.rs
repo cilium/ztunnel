@@ -33,6 +33,7 @@ use tokio::time::{Duration, Instant, sleep_until};
 use super::CaClient;
 use super::Error::{self, Spiffe};
 
+use crate::state::WorkloadInfo;
 use crate::strng::Strng;
 use backoff::{ExponentialBackoff, backoff::Backoff};
 use keyed_priority_queue::KeyedPriorityQueue;
@@ -172,6 +173,54 @@ pub struct CompositeId<K> {
 pub enum RequestKey {
     Identity(Identity),
     Workload(WorkloadUid),
+    /// Key for the SPIFFE Broker provider. Its attestor names the pod by
+    /// `(namespace, name, uid)`, so the `WorkloadInfo` travels with the uid
+    /// rather than being looked up again at fetch time.
+    BrokerWorkload {
+        uid: WorkloadUid,
+        workload: Arc<WorkloadInfo>,
+    },
+}
+
+/// A request to mint an SVID for a workload, as handed to a
+/// [`crate::identity::broker::attestor::WorkloadAttestor`].
+///
+/// `identity` is always present (the SPIFFE ID being requested). `workload`
+/// and `workload_uid` supply the per-pod context that providers like the
+/// SPIFFE Broker need for attestation; providers that key on identity alone
+/// (Istio CA) leave them `None`.
+#[derive(Debug, Clone)]
+pub struct CertRequest {
+    pub identity: Identity,
+    pub workload: Option<Arc<WorkloadInfo>>,
+    /// The Kubernetes pod UID (as delivered over ZDS from the CNI) for the
+    /// requesting workload. Used by the SPIFFE Broker `KubernetesObject`
+    /// attestor to build a `KubernetesObjectReference.uid`.
+    pub workload_uid: Option<Strng>,
+}
+
+impl CertRequest {
+    /// Construct a request with only a SPIFFE identity. Used by providers
+    /// that do not need per-workload attestation context.
+    pub fn new(identity: Identity) -> Self {
+        Self {
+            identity,
+            workload: None,
+            workload_uid: None,
+        }
+    }
+}
+
+impl From<Identity> for CertRequest {
+    fn from(identity: Identity) -> Self {
+        Self::new(identity)
+    }
+}
+
+impl From<&Identity> for CertRequest {
+    fn from(identity: &Identity) -> Self {
+        Self::new(identity.clone())
+    }
 }
 #[derive(
     Eq, PartialEq, Hash, Debug, Clone, PartialOrd, Ord, serde::Serialize, serde::Deserialize, Copy,
@@ -246,6 +295,40 @@ impl FromCompositeId for WorkloadUid {
             _ => Err(Error::InvalidConfiguration(
                 "expected Workload key for SPIRE attestation".to_string(),
             )),
+        }
+    }
+}
+
+/// Key handed to the SPIFFE Broker client: the pod UID plus the pod's
+/// `WorkloadInfo`, which its attestor turns into a
+/// `KubernetesObjectReference`.
+#[derive(Eq, PartialEq, Clone, Hash, Debug)]
+pub struct BrokerWorkloadKey {
+    pub uid: WorkloadUid,
+    pub workload: Arc<WorkloadInfo>,
+}
+
+impl FromCompositeId for BrokerWorkloadKey {
+    fn from_composite(id: &CompositeId<RequestKey>) -> Result<Self, Error> {
+        match id.key() {
+            RequestKey::BrokerWorkload { uid, workload } => Ok(Self {
+                uid: uid.clone(),
+                workload: workload.clone(),
+            }),
+            _ => Err(Error::InvalidConfiguration(
+                "expected BrokerWorkload key for SPIFFE Broker attestation".to_string(),
+            )),
+        }
+    }
+}
+
+impl CompositeId<BrokerWorkloadKey> {
+    /// Flatten into the [`CertRequest`] the broker's attestor consumes.
+    pub fn to_cert_request(&self) -> CertRequest {
+        CertRequest {
+            identity: self.id().clone(),
+            workload: Some(self.key().workload.clone()),
+            workload_uid: Some(strng::new(self.key().uid.clone().into_string())),
         }
     }
 }
@@ -396,10 +479,10 @@ impl Worker {
             Forgetting,
         }
 
-        // A set of futures refreshing the certificates. Each future completes with the identity for
-        // which it was invoked and a resulting certificate or error.
+        // A set of futures refreshing the certificates. Each future completes with the cache key
+        // for which it was invoked and a resulting certificate or error.
         let mut fetches = FuturesUnordered::new();
-        // The set of identities for which there are pending fetches. Elements of `fetches` and
+        // The set of cache keys for which there are pending fetches. Elements of `fetches` and
         // `processing` correspond to each other.
         let mut processing: HashMap<CompositeId<RequestKey>, Fetch> = HashMap::new();
         // Identities for which we will need to refresh certificates in the future, ordered by the
@@ -437,36 +520,36 @@ impl Worker {
                 // call made later by the client would result in another request being delivered to
                 // the worker.
                 res = requests.recv() => match res {
-                    Some(Request::Fetch(id, pri)) => {
-                        if !self.has_id(&id).await {
-                            // Nobody interested in the Identity anymore, do nothing.
+                    Some(Request::Fetch(key, pri)) => {
+                        if !self.has_id(&key).await {
+                            // Nobody interested in the key anymore, do nothing.
                             continue 'main;
                         }
-                        match processing.get(&id) {
+                        match processing.get(&key) {
                             None => {
-                                push_increase(&mut pending, id, PendingPriority(pri, Instant::now()));
+                                push_increase(&mut pending, key, PendingPriority(pri, Instant::now()));
                             },
                             Some(Fetch::Forgetting) => {
                                 // Once the associated future completes, the result will be dropped
                                 // instead of communicated back to the `certs` map and queued for
                                 // refresh.
-                                processing.insert(id, Fetch::Processing);
+                                processing.insert(key, Fetch::Processing);
                             },
                             Some(Fetch::Processing) => (),
                         }
                     },
-                    Some(Request::Forget(id)) => {
-                        if self.has_id(&id).await {
+                    Some(Request::Forget(key)) => {
+                        if self.has_id(&key).await {
                             // After the forget was queued, there was another request to start
-                            // managing the Identity. Do nothing.
+                            // managing the key. Do nothing.
                             continue 'main;
                         }
-                        match processing.get(&id) {
+                        match processing.get(&key) {
                             None => {
-                                pending.remove(&id);
+                                pending.remove(&key);
                             },
                             Some(Fetch::Processing) => {
-                                processing.insert(id, Fetch::Forgetting);
+                                processing.insert(key, Fetch::Forgetting);
                             },
                             Some(Fetch::Forgetting) => (),
                         }
@@ -475,9 +558,13 @@ impl Worker {
                 },
 
                 // Handle fetch results.
-                Some((id, res)) = fetches.next() => {
-                    tracing::trace!(%id, "fetch complete");
-                    match processing.remove(&id) {
+                Some((key, res)) = fetches.next() => {
+                    // Explicit binding to help inference: FuturesUnordered's element type
+                    // is otherwise inferred too late within the select! macro expansion.
+                    let key: CompositeId<RequestKey> = key;
+                    let id_for_trace = key.id().clone();
+                    tracing::trace!(id=%id_for_trace, "fetch complete");
+                    match processing.remove(&key) {
                         Some(Fetch::Processing) => (),
                         Some(Fetch::Forgetting) => continue 'main,
                         None => unreachable!("processing should represent all fetches"),
@@ -485,7 +572,7 @@ impl Worker {
                     let (state, refresh_at) = match res {
                         Err(err) => {
                             // Check if we should retain the existing valid certificate
-                            let existing_cert_info = self.get_existing_cert_info(&id).await;
+                            let existing_cert_info = self.get_existing_cert_info(&key).await;
 
                             // Use the next backoff to determine when to retry the fetch and default
                             // to the constant value if the backoff has been reset. In the case of
@@ -501,11 +588,11 @@ impl Worker {
                             // randomized interval =
                             //     retry_interval * (random value in range [1 - randomization_factor, 1 + randomization_factor])
                             //
-                            // Note that we are using a backoff-per-unique-identity-request. This is to prevent issues
-                            // when a cert cannot be fetched for Pod A, but that should not stall retries for
-                            // pods B, C, and D.
+                            // Note that we are using a backoff-per-unique-key. This is to prevent issues
+                            // when a cert cannot be fetched for one workload, but that should not stall
+                            // retries for other workloads.
 
-                            let mut keyed_backoff = match pending_backoffs_by_id.remove(&id) {
+                            let mut keyed_backoff = match pending_backoffs_by_id.remove(&key) {
                                 Some(backoff) => {
                                     backoff
                                 },
@@ -527,27 +614,27 @@ impl Worker {
                             };
                             let retry_delay = keyed_backoff.next_backoff().unwrap_or(CERT_REFRESH_FAILURE_RETRY_DELAY_MAX_INTERVAL);
                             // Store the per-key backoff, we're gonna retry.
-                            pending_backoffs_by_id.insert(id.clone(), keyed_backoff);
+                            pending_backoffs_by_id.insert(key.clone(), keyed_backoff);
                             let refresh_at = Instant::now() + retry_delay;
 
                             match existing_cert_info {
                                 // we do have a valid existing certificate, schedule retry
                                 Some((valid_cert, cert_expiry_instant)) => {
                                     let effective_refresh_at = std::cmp::min(refresh_at, cert_expiry_instant);
-                                    tracing::info!(%id, "certificate renewal failed ({err}); retaining existing valid certificate until {:?}; next retry at {:?}", cert_expiry_instant, effective_refresh_at);
+                                    tracing::info!(id=%id_for_trace, "certificate renewal failed ({err}); retaining existing valid certificate until {:?}; next retry at {:?}", cert_expiry_instant, effective_refresh_at);
                                     (CertState::Available(valid_cert), effective_refresh_at)
                                 },
                                 // we don't have a valid existing certificate
                                 None => {
-                                    tracing::warn!(%id, "certificate fetch failed ({err}) and no valid existing certificate; will retry in {retry_delay:?} (backoff capped at {CERT_REFRESH_FAILURE_RETRY_DELAY_MAX_INTERVAL:?})");
+                                    tracing::warn!(id=%id_for_trace, "certificate fetch failed ({err}) and no valid existing certificate; will retry in {retry_delay:?} (backoff capped at {CERT_REFRESH_FAILURE_RETRY_DELAY_MAX_INTERVAL:?})");
                                     (CertState::Unavailable(err), refresh_at)
                                 }
                             }
                         },
                         Ok(certs) => {
-                             tracing::debug!(%id, "certificate fetch succeeded");
+                             tracing::debug!(id=%id_for_trace, "certificate fetch succeeded");
                             // Reset (pop and drop) the backoff on success.
-                            pending_backoffs_by_id.remove(&id);
+                            pending_backoffs_by_id.remove(&key);
                             let certs: tls::WorkloadCertificate = certs; // Type annotation.
                             let refresh_at = self.time_conv.system_time_to_instant(certs.refresh_at());
                             let refresh_at = if let Some(t) = refresh_at {
@@ -566,17 +653,18 @@ impl Worker {
                             (CertState::Available(Arc::new(certs)), refresh_at)
                         },
                     };
-                    if self.update_certs(&id, state).await {
-                        push_increase(&mut pending, id, PendingPriority(Priority::Background, refresh_at));
+                    if self.update_certs(&key, state).await {
+                        push_increase(&mut pending, key, PendingPriority(Priority::Background, refresh_at));
                     }
                 },
                 // Initiate the next fetch.
                 true = maybe_sleep_until(next), if fetches.len() < self.concurrency as usize => {
-                    let (id, _) = pending.pop().expect("pending should always have an element at this point");
-                    processing.insert(id.to_owned(), Fetch::Processing);
+                    let (key, _) = pending.pop().expect("pending should always have an element at this point");
+                    processing.insert(key.clone(), Fetch::Processing);
                     fetches.push(async move {
-                        let res = self.client.fetch_certificate(&id).await;
-                        (id, res)
+                        let res: Result<tls::WorkloadCertificate, Error> =
+                            self.client.fetch_certificate(&key).await;
+                        (key, res)
                     });
                 },
             };
@@ -687,6 +775,23 @@ impl fmt::Debug for SecretManager {
 
 impl SecretManager {
     pub async fn new(cfg: Arc<crate::config::Config>) -> Result<Self, Error> {
+        match &cfg.ca_provider {
+            crate::config::CaProvider::IstioCa => Self::new_istio_ca(cfg).await,
+            #[cfg(target_os = "linux")]
+            crate::config::CaProvider::SpiffeBroker(broker_cfg) => {
+                Self::new_spiffe_broker(broker_cfg).await
+            }
+            // `validate_config` rejects `SpiffeBroker` on non-Linux at
+            // startup, so the variant is statically unreachable here even
+            // though the enum still carries it.
+            #[cfg(not(target_os = "linux"))]
+            crate::config::CaProvider::SpiffeBroker(_) => {
+                unreachable!("SpiffeBroker CA provider is rejected on non-Linux by validate_config")
+            }
+        }
+    }
+
+    async fn new_istio_ca(cfg: Arc<crate::config::Config>) -> Result<Self, Error> {
         let caclient = CaClient::new(
             cfg.ca_address
                 .clone()
@@ -700,6 +805,107 @@ impl SecretManager {
         )
         .await?;
         Ok(Self::new_with_client(caclient))
+    }
+
+    /// Build a `SecretManager` backed by the SPIFFE Broker provider.
+    ///
+    /// Bootstrap sequence:
+    /// 1. Open the SPIFFE Workload API socket (plain UDS, no mTLS — auth'd
+    ///    server-side by `SO_PEERCRED` + workload attestation) and fetch
+    ///    ztunnel's own SVID via [`SvidSource::bootstrap`]. A detached
+    ///    background task keeps that SVID fresh as it rotates.
+    /// 2. Open an mTLS-wrapped UDS channel to the SPIFFE Broker, using the
+    ///    bootstrapped SVID as both the client certificate and the trust
+    ///    root for the broker's server cert.
+    /// 3. Share that channel between
+    ///    (a) a [`SpiffeBrokerClient`] that mints per-workload SVIDs on
+    ///    demand via `SubscribeToX509SVID`, and
+    ///    (b) a long-lived background subscriber that keeps a process-wide
+    ///    federated trust-bundle cache fresh via
+    ///    `SubscribeToX509Bundles`.
+    ///
+    /// Linux-only: the broker stack depends on inpod-only data structures and
+    /// is rejected outside inpod by `config::validate_config`.
+    #[cfg(target_os = "linux")]
+    async fn new_spiffe_broker(
+        broker_cfg: &crate::config::SpiffeBrokerConfig,
+    ) -> Result<Self, Error> {
+        use crate::config::BrokerAttestation;
+        use crate::identity::broker::attestor::{KubernetesObjectAttestor, WorkloadAttestor};
+        use crate::identity::broker::bundles::{TrustBundleStore, spawn_bundle_subscriber};
+        use crate::identity::broker::channel::UdsGrpcChannel;
+        use crate::identity::broker::client::SpiffeBrokerClient;
+
+        let attestor: Arc<dyn WorkloadAttestor> = match broker_cfg.attestation {
+            BrokerAttestation::KubernetesObject => Arc::new(KubernetesObjectAttestor),
+        };
+
+        // Step 1: bootstrap ztunnel's SVID from the Workload API.
+        //
+        // On a freshly started node the SPIRE agent's Workload API socket may
+        // not exist yet, or ztunnel's own registration entry may not have
+        // propagated, so the first attempts can fail transiently. Rather than
+        // returning an error here (which turns a routine startup race into a
+        // CrashLoopBackOff), retry with a capped backoff. ztunnel has no
+        // liveness probe and its readiness server has not started yet, so while
+        // we wait the pod simply reports NotReady and recovers automatically
+        // once SPIRE is reachable.
+        let svid_source = Self::bootstrap_svid_with_retry(broker_cfg).await;
+
+        // Step 2: open the mTLS-wrapped broker channel.
+        let channel = UdsGrpcChannel::new_mtls(broker_cfg.socket_path.clone(), svid_source)?;
+
+        let bundle_store = TrustBundleStore::new();
+        // Detached for the lifetime of the SecretManager (process-scoped).
+        // The task reconnects on failure with capped backoff.
+        spawn_bundle_subscriber(channel.clone(), Arc::clone(&bundle_store));
+        let client =
+            SpiffeBrokerClient::with_channel(attestor, channel, bundle_store, broker_cfg.timeout);
+        Ok(Self::new_with_client(client))
+    }
+
+    /// Bootstrap ztunnel's own SVID from the SPIFFE Workload API, retrying
+    /// with a capped exponential backoff until it succeeds.
+    ///
+    /// At node startup the SPIRE agent (and thus its Workload API socket) may
+    /// come up after ztunnel, and ztunnel's own registration entry may take a
+    /// moment to propagate. Both make the first bootstrap attempts fail with
+    /// transient transport/timeout/mismatch errors. Retrying in-process keeps
+    /// the pod alive (it reports NotReady until ready) instead of exiting and
+    /// entering CrashLoopBackOff.
+    #[cfg(target_os = "linux")]
+    async fn bootstrap_svid_with_retry(
+        broker_cfg: &crate::config::SpiffeBrokerConfig,
+    ) -> Arc<crate::identity::broker::svid_source::SvidSource> {
+        use crate::identity::broker::svid_source::SvidSource;
+
+        const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
+        const MAX_BACKOFF: Duration = Duration::from_secs(30);
+
+        let mut backoff = INITIAL_BACKOFF;
+        let mut attempt: u64 = 0;
+        loop {
+            attempt += 1;
+            match SvidSource::bootstrap(
+                broker_cfg.workload_api_socket.clone(),
+                broker_cfg.workload_api_spiffe_id.clone(),
+            )
+            .await
+            {
+                Ok(source) => return source,
+                Err(err) => {
+                    tracing::warn!(
+                        attempt,
+                        retry_in = ?backoff,
+                        "failed to bootstrap ztunnel SVID from the SPIFFE Workload API ({err}); \
+                         the SPIRE agent socket may not be ready yet. Will retry; the pod stays \
+                         NotReady until this succeeds"
+                    );
+                    tokio::time::sleep(backoff).await;
+                    backoff = std::cmp::min(backoff.saturating_mul(2), MAX_BACKOFF);
+                }
+            }
+        }
     }
 
     pub fn new_with_client<C: 'static + CaClientTrait>(client: C) -> Self
@@ -765,9 +971,10 @@ impl SecretManager {
         id: &CompositeId<RequestKey>,
         pri: Priority,
     ) -> Result<watch::Receiver<CertState>, Error> {
+        let key = id.clone();
         let mut certs = self.worker.certs.lock().await;
-        match certs.get(id) {
-            // Identity found in cache and is already being refreshed. Bump the priority if needed.
+        match certs.get(&key) {
+            // Key found in cache and is already being refreshed. Bump the priority if needed.
             Some(st) => {
                 let rx = st.rx.clone();
                 drop(certs);
@@ -775,17 +982,17 @@ impl SecretManager {
                 if let Some(existing_pri) = init_pri(&rx)
                     && pri > existing_pri
                 {
-                    self.post(Request::Fetch(id.clone(), pri)).await;
+                    self.post(Request::Fetch(key, pri)).await;
                 }
                 Ok(rx)
             }
-            // New identity, start managing it and return the newly created channel.
+            // New key, start managing it and return the newly created channel.
             None => {
                 let (tx, rx) = watch::channel(CertState::Initializing(pri));
-                certs.insert(id.to_owned(), CertChannel { rx: rx.clone(), tx });
+                certs.insert(key.clone(), CertChannel { rx: rx.clone(), tx });
                 drop(certs);
                 // Notify the background worker to start refreshing the certificate.
-                self.post(Request::Fetch(id.to_owned(), pri)).await;
+                self.post(Request::Fetch(key, pri)).await;
                 Ok(rx)
             }
         }
@@ -834,11 +1041,31 @@ impl SecretManager {
         self.fetch_certificate_pri(id, Priority::RealTime).await
     }
 
+    /// Fetch (or wait for) the SVID for `id`, supplying the per-workload
+    /// context the SPIFFE Broker's attestor needs.
+    ///
+    /// Keyed by [`RequestKey::BrokerWorkload`] so two pods sharing a SPIFFE
+    /// identity each get their own attested SVID rather than racing for a
+    /// shared one. Callers should only use this when the configured provider
+    /// is the SPIFFE Broker; the Istio CA path keeps using
+    /// [`Self::fetch_certificate`] so SVIDs continue to dedupe across pods
+    /// that share an identity.
+    pub async fn fetch_workload_certificate(
+        &self,
+        id: &Identity,
+        workload: Arc<WorkloadInfo>,
+        uid: WorkloadUid,
+    ) -> Result<Arc<tls::WorkloadCertificate>, Error> {
+        let key = CompositeId::new(id.clone(), RequestKey::BrokerWorkload { uid, workload });
+        self.fetch_certificate_pri(&key, Priority::RealTime).await
+    }
+
     pub async fn forget_certificate(&self, id: &CompositeId<RequestKey>) {
         // TODO: consider keeping the cert around for a minute or so to avoid churn
         // We would ideally drop any pending or new requests to rotate.
-        if self.worker.certs.lock().await.remove(id).is_some() {
-            self.post(Request::Forget(id.clone())).await;
+        let key = id.clone();
+        if self.worker.certs.lock().await.remove(&key).is_some() {
+            self.post(Request::Forget(key)).await;
         }
     }
 
@@ -849,8 +1076,8 @@ impl SecretManager {
         f: impl Fn(&CompositeId<RequestKey>, &CertState) -> R,
     ) -> Vec<R> {
         let mut ret = Vec::new();
-        for (id, chan) in self.worker.certs.lock().await.iter() {
-            ret.push(f(id, &chan.rx.borrow()));
+        for (key, chan) in self.worker.certs.lock().await.iter() {
+            ret.push(f(key, &chan.rx.borrow()));
         }
         ret
     }
@@ -888,6 +1115,31 @@ pub mod mock {
             fetch_latency: Duration::ZERO,
             epoch: None,
         })
+    }
+
+    // Like `new_secret_manager` but also returns a clone of the underlying mock
+    // CaClient so tests can inspect what was requested (e.g. whether each fetch
+    // carried WorkloadInfo). MockCaClient is cheap to clone (Arc-backed).
+    pub fn new_secret_manager_with_client(
+        cert_lifetime: Duration,
+    ) -> (Arc<SecretManager>, MockCaClient) {
+        let time_conv = crate::time::Converter::new_at(SystemTime::now());
+        let client = MockCaClient::new(mock::ClientConfig {
+            cert_lifetime,
+            fetch_latency: Duration::ZERO,
+            time_conv: time_conv.clone(),
+        });
+        let sm = Arc::new(
+            SecretManager::new_internal(
+                Box::new(client.clone()),
+                super::SecretManagerConfig {
+                    time_conv,
+                    concurrency: 2,
+                },
+            )
+            .0,
+        );
+        (sm, client)
     }
 
     // There is no need to return Arc, but most callers want one so it simplifies the code - and we
@@ -1020,6 +1272,72 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    // Regression test for the SPIFFE Broker (workload-keyed) path: a cert
+    // fetched via `fetch_workload_certificate` must keep rotating in the
+    // background, and every fetch — initial and each refresh — must carry
+    // WorkloadInfo. The broker's KubernetesObject attestor requires it on
+    // every call, so dropping it on refresh would stall rotation and let the
+    // SVID expire.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_workload_keyed_cert_rotation_carries_workload() {
+        use crate::state::WorkloadInfo;
+
+        // Short lifetime so the background refresh (at half-life) fires quickly.
+        let cert_lifetime = Duration::from_millis(50);
+        let (sm, client) = mock::new_secret_manager_with_client(cert_lifetime);
+
+        let id = Identity::Spiffe {
+            trust_domain: "cluster.local".into(),
+            namespace: "ztunnel-broker-test".into(),
+            service_account: "probe".into(),
+        };
+        let workload = Arc::new(WorkloadInfo::new(
+            "probe-a".to_string(),
+            "ztunnel-broker-test".to_string(),
+            "probe".to_string(),
+        ));
+        let uid = WorkloadUid::new("pod-uid-1".to_string());
+
+        let first = sm
+            .fetch_workload_certificate(&id, workload.clone(), uid.clone())
+            .await
+            .expect("initial workload cert");
+
+        // Wait until the background refresh rotates the cert (serial changes).
+        // The repeated fetches here hit the cached entry and do not trigger new
+        // fetches themselves, so any rotation observed comes from the background
+        // refresh task.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let cur = sm
+                    .fetch_workload_certificate(&id, workload.clone(), uid.clone())
+                    .await
+                    .expect("workload cert");
+                if cur.cert.serial() != first.cert.serial() {
+                    let new = cur.cert.expiration().not_before;
+                    let old = first.cert.expiration().not_before;
+                    assert!(old < new, "rotated cert should be newer");
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("workload cert should rotate within the timeout");
+
+        // Every fetch (initial + each background refresh) must have carried
+        // WorkloadInfo; otherwise the broker attestor would reject the request.
+        let presence = client.workload_present().await;
+        assert!(
+            presence.len() >= 2,
+            "expected at least one background refresh, got fetches: {presence:?}"
+        );
+        assert!(
+            presence.iter().all(|&p| p),
+            "every fetch must carry workload context: {presence:?}"
+        );
     }
 
     fn collect_strings<T: IntoIterator>(xs: T) -> Vec<String>
@@ -1375,7 +1693,7 @@ mod tests {
         test.caclient.set_error(true).await;
         assert!(
             test.caclient
-                .fetch_certificate(&CompositeId::with_key(id.clone(), id.clone(),))
+                .fetch_certificate(&id.to_composite_id())
                 .await
                 .is_err()
         );

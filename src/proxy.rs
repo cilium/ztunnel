@@ -208,13 +208,24 @@ impl LocalWorkloadInformation {
             .get_workload()
             .await
             .map_err(|_| identity::Error::UnknownWorkload(self.workload_info()))?;
-        let id = &Identity::Spiffe {
+        let id = Identity::Spiffe {
             trust_domain: wl.trust_domain.clone(),
             namespace: (&self.wi.namespace).into(),
             service_account: (&self.wi.service_account).into(),
         };
 
-        let key = if self.cfg.spire_enabled {
+        let key = if matches!(self.cfg.ca_provider, config::CaProvider::SpiffeBroker(_)) {
+            // The broker's attestor identifies the pod by (namespace, name, uid), so key the
+            // cache per-workload and carry the WorkloadInfo through to the client. Two pods
+            // sharing a service account each get their own attested SVID.
+            CompositeId::new(
+                id.clone(),
+                RequestKey::BrokerWorkload {
+                    uid: WorkloadUid::new(wl.uid.to_string()),
+                    workload: self.wi.clone(),
+                },
+            )
+        } else if self.cfg.spire_enabled {
             CompositeId::new(
                 id.clone(),
                 RequestKey::Workload(WorkloadUid::new(wl.uid.to_string())),
