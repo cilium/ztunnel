@@ -12,15 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::dns::resolver::{Answer, Resolver};
+use crate::dns::resolver::{Resolver, Response};
 use crate::proxy::SocketFactory;
-use hickory_proto::runtime::RuntimeProvider;
-use hickory_proto::runtime::iocompat::AsyncIoTokioAsStd;
-use hickory_resolver::ResolveError;
+use hickory_net::NetError;
+use hickory_net::runtime::RuntimeProvider;
+use hickory_net::runtime::iocompat::AsyncIoTokioAsStd;
 use hickory_resolver::config::{ResolverConfig, ResolverOpts};
-use hickory_resolver::name_server::GenericConnector;
-use hickory_server::authority::LookupError;
 use hickory_server::server::Request;
+use hickory_server::zone_handler::LookupError;
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
@@ -30,7 +29,7 @@ use std::time::Duration;
 use tokio::net::{TcpStream, UdpSocket};
 
 /// A forwarding [Resolver] that delegates requests to an upstream [TokioAsyncResolver].
-pub struct Forwarder(hickory_resolver::Resolver<GenericConnector<RuntimeProviderAdaptor>>);
+pub struct Forwarder(hickory_resolver::Resolver<RuntimeProviderAdaptor>);
 
 impl Forwarder {
     /// Creates a new [Forwarder] from the provided resolver configuration.
@@ -38,26 +37,26 @@ impl Forwarder {
         cfg: ResolverConfig,
         socket_factory: Arc<dyn SocketFactory + Send + Sync>,
         opts: ResolverOpts,
-    ) -> Result<Self, ResolveError> {
-        let provider = GenericConnector::new(RuntimeProviderAdaptor {
+    ) -> Result<Self, NetError> {
+        let provider = RuntimeProviderAdaptor {
             socket_factory,
             handle: Default::default(),
-        });
+        };
         let mut resolver = hickory_resolver::Resolver::builder_with_config(cfg, provider);
         *resolver.options_mut() = opts;
-        Ok(Self(resolver.build()))
+        Ok(Self(resolver.build()?))
     }
 }
 
 #[derive(Clone)]
 struct RuntimeProviderAdaptor {
     socket_factory: Arc<dyn SocketFactory + Send + Sync>,
-    handle: hickory_proto::runtime::TokioHandle,
+    handle: hickory_net::runtime::TokioHandle,
 }
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 impl RuntimeProvider for RuntimeProviderAdaptor {
-    type Handle = hickory_proto::runtime::TokioHandle;
-    type Timer = hickory_proto::runtime::TokioTime;
+    type Handle = hickory_net::runtime::TokioHandle;
+    type Timer = hickory_net::runtime::TokioTime;
     type Udp = UdpSocket;
     type Tcp = AsyncIoTokioAsStd<TcpStream>;
 
@@ -107,7 +106,7 @@ impl RuntimeProvider for RuntimeProviderAdaptor {
 
 #[async_trait::async_trait]
 impl Resolver for Forwarder {
-    async fn lookup(&self, request: &Request) -> Result<Answer, LookupError> {
+    async fn lookup(&self, request: &Request) -> Result<Response, LookupError> {
         // TODO(nmittler): Should we allow requests to the upstream resolver to be authoritative?
         let query = request.request_info()?.query;
         let name = query.name();
@@ -115,7 +114,7 @@ impl Resolver for Forwarder {
         self.0
             .lookup(name, rr_type)
             .await
-            .map(Answer::from)
+            .map(Response::from)
             .map_err(LookupError::from)
     }
 }
@@ -126,11 +125,11 @@ mod tests {
     use crate::dns::resolver::Resolver;
     use crate::test_helpers::dns::{a_request, ip, n, run_dns, socket_addr};
     use crate::test_helpers::helpers::initialize_telemetry;
-    use hickory_proto::ProtoErrorKind;
+    use hickory_net::xfer::Protocol;
+    use hickory_net::{DnsError, NetError, NoRecords};
     use hickory_proto::op::ResponseCode;
     use hickory_proto::rr::RecordType;
-    use hickory_proto::xfer::Protocol;
-    use hickory_resolver::ResolveErrorKind;
+    use hickory_server::zone_handler::LookupError;
     use std::collections::HashMap;
 
     #[tokio::test]
@@ -150,11 +149,11 @@ mod tests {
             socket_addr("1.1.1.1:80"),
             Protocol::Udp,
         );
-        let answer = f.lookup(&req).await.unwrap();
-        assert!(!answer.is_authoritative());
+        let response = f.lookup(&req).await.unwrap();
+        assert!(!response.is_authoritative());
 
-        let record = answer.record_iter().next().unwrap();
-        assert_eq!(n("test.example.com."), *record.name());
+        let record = response.answers().next().unwrap();
+        assert_eq!(n("test.example.com."), record.name);
         assert_eq!(RecordType::A, record.record_type());
     }
 
@@ -171,22 +170,15 @@ mod tests {
             Protocol::Udp,
         );
 
-        // Expect a ResolveError.
-        let err = f
-            .lookup(&req)
-            .await
-            .expect_err("expected error")
-            .into_resolve_error()
-            .expect("expected resolve error");
-
-        // Expect NoRecordsFound with a NXDomain response code.
-        if let ResolveErrorKind::Proto(proto) = err.kind()
-            && let ProtoErrorKind::NoRecordsFound { response_code, .. } = proto.kind()
-        {
-            // Respond with the error code.
-            assert_eq!(&ResponseCode::NXDomain, response_code);
-            return;
+        match f.lookup(&req).await.expect_err("expected error") {
+            LookupError::NetError(NetError::Dns(DnsError::NoRecordsFound(NoRecords {
+                response_code,
+                ..
+            }))) => {
+                assert_eq!(ResponseCode::NXDomain, response_code);
+                return;
+            }
+            err => panic!("unexpected error kind {err:?}"),
         }
-        panic!("unexpected error kind {}", err.kind())
     }
 }

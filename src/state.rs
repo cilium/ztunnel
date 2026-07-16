@@ -36,7 +36,7 @@ use educe::Educe;
 use futures_util::FutureExt;
 use hickory_resolver::TokioResolver;
 use hickory_resolver::config::*;
-use hickory_resolver::name_server::TokioConnectionProvider;
+use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use itertools::Itertools;
 use rand::prelude::IteratorRandom;
 use rand::seq::IndexedRandom;
@@ -241,20 +241,26 @@ impl ProxyState {
     }
 
     /// Find either a workload or service by the destination.
-    pub fn find_destination(&self, dest: &Destination) -> Option<Address> {
+    /// If `ns` is provided, prefer a service in that namespace when multiple share the same VIP.
+    pub fn find_destination(&self, dest: &Destination, ns: Option<&Strng>) -> Option<Address> {
         match dest {
-            Destination::Address(addr) => self.find_address(addr),
+            Destination::Address(addr) => self.find_address(addr, ns),
             Destination::Hostname(hostname) => self.find_hostname(hostname),
         }
     }
 
     /// Find either a workload or a service by address.
-    pub fn find_address(&self, network_addr: &NetworkAddress) -> Option<Address> {
+    /// If `ns` is provided, prefer a service in that namespace when multiple share the same VIP.
+    pub fn find_address(
+        &self,
+        network_addr: &NetworkAddress,
+        ns: Option<&Strng>,
+    ) -> Option<Address> {
         // 1. handle workload ip, if workload not found fallback to service.
         match self.workloads.find_address(network_addr) {
             None => {
                 // 2. handle service
-                if let Some(svc) = self.services.get_by_vip(network_addr) {
+                if let Some(svc) = self.services.get_best_by_vip(network_addr, ns) {
                     return Some(Address::Service(svc));
                 }
                 None
@@ -300,10 +306,10 @@ impl ProxyState {
         addr: SocketAddr,
         resolution_mode: ServiceResolutionMode,
     ) -> Option<UpstreamDestination> {
-        if let Some(svc) = self
-            .services
-            .get_by_vip(&network_addr(network.clone(), addr.ip()))
-        {
+        if let Some(svc) = self.services.get_best_by_vip(
+            &network_addr(network.clone(), addr.ip()),
+            Some(&source_workload.namespace),
+        ) {
             if let Some(lb) = &svc.load_balancer
                 && lb.mode == LoadBalancerMode::Passthrough
             {
@@ -512,6 +518,24 @@ impl DemandProxyState {
     }
 }
 
+/// sample_weighted_waypoint picks one waypoint from a service's weighted set, proportional to
+/// each entry's weight (used to shift a share of connections between waypoints during a canary).
+/// Returns None when there is no usable weighted set — an empty set, or one that is not samplable
+/// (e.g. all weights zero) — in which case the caller falls back to the single `waypoint` field.
+fn sample_weighted_waypoint<'a>(
+    service: &'a Service,
+    rng: &mut impl rand::Rng,
+) -> Option<&'a GatewayAddress> {
+    if service.weighted_waypoints.is_empty() {
+        return None;
+    }
+    service
+        .weighted_waypoints
+        .choose_weighted(rng, |ww| ww.weight)
+        .ok()
+        .map(|ww| &ww.destination)
+}
+
 impl DemandProxyState {
     pub fn new(
         state: Arc<RwLock<ProxyState>>,
@@ -522,10 +546,10 @@ impl DemandProxyState {
     ) -> Self {
         let mut rb = hickory_resolver::Resolver::builder_with_config(
             dns_resolver_cfg,
-            TokioConnectionProvider::default(),
+            TokioRuntimeProvider::default(),
         );
         *rb.options_mut() = dns_resolver_opts;
-        let dns_resolver = rb.build();
+        let dns_resolver = rb.build().expect("dns resolver config should be valid");
         Self {
             state,
             demand,
@@ -722,9 +746,7 @@ impl DemandProxyState {
         trace!(%hostname, "dns lookup complete {resp:?}");
 
         let (matching, unmatching): (Vec<_>, Vec<_>) = resp
-            .as_lookup()
-            .record_iter()
-            .filter_map(|record| record.data().ip_addr())
+            .iter()
             .partition(|record| record.is_ipv6() == original_target_address.is_ipv6());
         // Randomly pick an IP, prefer to match the IP family of the downstream request.
         // Without this, we run into trouble in pure v4 or pure v6 environments.
@@ -818,8 +840,11 @@ impl DemandProxyState {
         addr: SocketAddr,
         resolution_mode: ServiceResolutionMode,
     ) -> Result<Option<Upstream>, Error> {
-        self.fetch_address(&network_addr(network.clone(), addr.ip()))
-            .await;
+        self.fetch_address(
+            &network_addr(network.clone(), addr.ip()),
+            Some(&source_workload.namespace),
+        )
+        .await;
         let upstream = {
             self.read()
                 .find_upstream(network, source_workload, addr, resolution_mode)
@@ -989,9 +1014,17 @@ impl DemandProxyState {
         source_workload: &Workload,
         original_destination_address: SocketAddr,
     ) -> Result<Option<Upstream>, Error> {
-        let Some(gw_address) = &service.waypoint else {
-            // no waypoint
-            return Ok(None);
+        // Choose a weighted waypoint, else fall back to the single
+        // `waypoint` field, preserving existing behavior.
+        let gw_address = match sample_weighted_waypoint(service, &mut rand::rng()) {
+            Some(gw_address) => gw_address,
+            None => {
+                let Some(gw_address) = &service.waypoint else {
+                    // no waypoint
+                    return Ok(None);
+                };
+                gw_address
+            }
         };
         self.fetch_waypoint(gw_address, source_workload, original_destination_address)
             .await
@@ -1015,19 +1048,29 @@ impl DemandProxyState {
 
     /// Looks for either a workload or service by the destination. If not found locally,
     /// attempts to fetch on-demand.
-    pub async fn fetch_destination(&self, dest: &Destination) -> Option<Address> {
+    /// If `ns` is provided, prefer a service in that namespace when multiple share the same VIP.
+    pub async fn fetch_destination(
+        &self,
+        dest: &Destination,
+        ns: Option<&Strng>,
+    ) -> Option<Address> {
         match dest {
-            Destination::Address(addr) => self.fetch_address(addr).await,
+            Destination::Address(addr) => self.fetch_address(addr, ns).await,
             Destination::Hostname(hostname) => self.fetch_hostname(hostname).await,
         }
     }
 
     /// Looks for the given address to find either a workload or service by IP. If not found
     /// locally, attempts to fetch on-demand.
-    pub async fn fetch_address(&self, network_addr: &NetworkAddress) -> Option<Address> {
+    /// If `ns` is provided, prefer a service in that namespace when multiple share the same VIP.
+    pub async fn fetch_address(
+        &self,
+        network_addr: &NetworkAddress,
+        ns: Option<&Strng>,
+    ) -> Option<Address> {
         // Wait for it on-demand, *if* needed
         debug!(%network_addr.address, "fetch address");
-        if let Some(address) = self.read().find_address(network_addr) {
+        if let Some(address) = self.read().find_address(network_addr, ns) {
             return Some(address);
         }
         if !self.supports_on_demand() {
@@ -1035,7 +1078,7 @@ impl DemandProxyState {
         }
         // if both cache not found, start on demand fetch
         self.fetch_on_demand(network_addr.to_string().into()).await;
-        self.read().find_address(network_addr)
+        self.read().find_address(network_addr, ns)
     }
 
     /// Looks for the given hostname to find either a workload or service by IP. If not found
@@ -1165,6 +1208,114 @@ mod tests {
 
     use crate::{strng, test_helpers};
     use test_case::test_case;
+
+    #[test]
+    fn test_sample_weighted_waypoint() {
+        use crate::state::service::WeightedWaypoint;
+        let ga = |ip: &str| GatewayAddress {
+            destination: Destination::Address(NetworkAddress {
+                network: "".into(),
+                address: ip.parse().unwrap(),
+            }),
+            hbone_mtls_port: 15008,
+        };
+        let svc = |waypoint: Option<GatewayAddress>, weighted: Vec<WeightedWaypoint>| Service {
+            waypoint,
+            weighted_waypoints: weighted,
+            ..test_helpers::mock_default_service()
+        };
+        let a = ga("10.0.0.1");
+        let b = ga("10.0.0.2");
+        // Seed deterministically so the distribution assertion below cannot flake.
+        use rand::SeedableRng;
+        let mut rng = rand::rngs::SmallRng::seed_from_u64(0);
+
+        // No weighted set -> None (caller falls back to the single `waypoint` field).
+        assert_eq!(sample_weighted_waypoint(&svc(None, vec![]), &mut rng), None);
+
+        // A zero-weight entry is never selected: [100, 0] always picks the first (primary).
+        let primary_only = svc(
+            None,
+            vec![
+                WeightedWaypoint {
+                    destination: a.clone(),
+                    weight: 100,
+                },
+                WeightedWaypoint {
+                    destination: b.clone(),
+                    weight: 0,
+                },
+            ],
+        );
+        for _ in 0..50 {
+            assert_eq!(sample_weighted_waypoint(&primary_only, &mut rng), Some(&a));
+        }
+
+        // [0, 100] always picks the second (canary fully promoted).
+        let canary_only = svc(
+            None,
+            vec![
+                WeightedWaypoint {
+                    destination: a.clone(),
+                    weight: 0,
+                },
+                WeightedWaypoint {
+                    destination: b.clone(),
+                    weight: 100,
+                },
+            ],
+        );
+        for _ in 0..50 {
+            assert_eq!(sample_weighted_waypoint(&canary_only, &mut rng), Some(&b));
+        }
+
+        // All-zero weights are not samplable -> None (fall back to primary).
+        let all_zero = svc(
+            Some(a.clone()),
+            vec![
+                WeightedWaypoint {
+                    destination: a.clone(),
+                    weight: 0,
+                },
+                WeightedWaypoint {
+                    destination: b.clone(),
+                    weight: 0,
+                },
+            ],
+        );
+        assert_eq!(sample_weighted_waypoint(&all_zero, &mut rng), None);
+
+        // A genuine split tracks the configured weights across many samples.
+        // 75/25 is asymmetric so the assertion would catch a swapped or ignored weight.
+        let split = svc(
+            None,
+            vec![
+                WeightedWaypoint {
+                    destination: a.clone(),
+                    weight: 75,
+                },
+                WeightedWaypoint {
+                    destination: b.clone(),
+                    weight: 25,
+                },
+            ],
+        );
+        let n = 10_000;
+        let (mut count_a, mut count_b) = (0, 0);
+        for _ in 0..n {
+            match sample_weighted_waypoint(&split, &mut rng) {
+                Some(x) if *x == a => count_a += 1,
+                Some(x) if *x == b => count_b += 1,
+                other => panic!("unexpected selection: {other:?}"),
+            }
+        }
+        // Expect ~75/25. With a fixed seed and a wide tolerance this is stable, not statistical.
+        let frac_a = count_a as f64 / n as f64;
+        assert!(
+            (0.70..0.80).contains(&frac_a),
+            "expected ~75% for a, got {frac_a} (a={count_a}, b={count_b})"
+        );
+    }
 
     #[tokio::test]
     async fn test_wait_for_workload() {
@@ -1297,7 +1448,7 @@ mod tests {
         });
         test_helpers::assert_eventually(
             Duration::from_secs(5),
-            || mock_proxy_state.fetch_destination(&dst),
+            || mock_proxy_state.fetch_destination(&dst, None),
             Some(Address::Workload(Arc::new(
                 test_helpers::test_default_workload(),
             ))),
@@ -1311,7 +1462,7 @@ mod tests {
         });
         test_helpers::assert_eventually(
             Duration::from_secs(5),
-            || mock_proxy_state.fetch_destination(&dst),
+            || mock_proxy_state.fetch_destination(&dst, None),
             Some(Address::Service(Arc::new(
                 test_helpers::mock_default_service(),
             ))),
@@ -1325,7 +1476,7 @@ mod tests {
         });
         test_helpers::assert_eventually(
             Duration::from_secs(5),
-            || mock_proxy_state.fetch_destination(&dst),
+            || mock_proxy_state.fetch_destination(&dst, None),
             None,
         )
         .await;
@@ -1337,7 +1488,7 @@ mod tests {
         });
         test_helpers::assert_eventually(
             Duration::from_secs(5),
-            || mock_proxy_state.fetch_destination(&dst),
+            || mock_proxy_state.fetch_destination(&dst, None),
             None,
         )
         .await;

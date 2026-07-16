@@ -20,6 +20,7 @@ use crate::strng::Strng;
 use crate::xds::istio::workload::{Port, PortList};
 use crate::{strng, xds};
 use bytes::Bytes;
+use ipnet::IpNet;
 use serde::Deserialize;
 use serde::Deserializer;
 use serde::Serialize;
@@ -675,6 +676,24 @@ pub fn network_addr(network: Strng, vip: IpAddr) -> NetworkAddress {
     }
 }
 
+#[derive(Debug, Eq, PartialEq, Hash, Clone, serde::Serialize, serde::Deserialize)]
+pub struct NetworkCidr {
+    pub network: Strng,
+    pub cidr: IpNet,
+}
+
+impl fmt::Display for NetworkCidr {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str(&self.network)?;
+        f.write_char('/')?;
+        fmt::Display::fmt(&self.cidr, f)
+    }
+}
+
+pub fn network_cidr(network: Strng, cidr: IpNet) -> NetworkCidr {
+    NetworkCidr { network, cidr }
+}
+
 /// WorkloadIdentity provides information about a workloads identity. This is used in place of Identity
 /// in places where we do not have the full identity (no trust domain) and know we are working with workloads specifically.
 #[derive(Debug, Hash, Eq, PartialEq)]
@@ -1128,6 +1147,7 @@ mod tests {
                     addresses: vec![XdsNetworkAddress {
                         network: "".to_string(),
                         address: vip1.octets().to_vec(),
+                        length: None,
                     }],
                     ports: vec![XdsPort {
                         service_port: 80,
@@ -1135,10 +1155,12 @@ mod tests {
                     }],
                     subject_alt_names: vec![],
                     waypoint: None,
+                    weighted_waypoints: vec![],
                     load_balancing: None,
                     ip_families: 0,
                     extensions: Default::default(),
                     canonical: true,
+                    visibility: 0,
                 },
             )
             .unwrap();
@@ -1158,10 +1180,12 @@ mod tests {
                         XdsNetworkAddress {
                             network: "".to_string(),
                             address: vip1.octets().to_vec(), // old endpoints associated with this address should be carried over
+                            length: None,
                         },
                         XdsNetworkAddress {
                             network: "".to_string(),
                             address: vip2.octets().to_vec(), // new address just to test upsert
+                            length: None,
                         },
                     ],
                     ports: vec![XdsPort {
@@ -1170,10 +1194,12 @@ mod tests {
                     }],
                     subject_alt_names: vec![],
                     waypoint: None,
+                    weighted_waypoints: vec![],
                     load_balancing: None,
                     ip_families: 0,
                     extensions: Default::default(),
                     canonical: true,
+                    visibility: 0,
                 },
             )
             .unwrap();
@@ -1199,10 +1225,13 @@ mod tests {
                 .read()
                 .unwrap()
                 .services
-                .get_by_vip(&NetworkAddress {
-                    network: strng::EMPTY,
-                    address: IpAddr::V4(vip1),
-                })
+                .get_best_by_vip(
+                    &NetworkAddress {
+                        network: strng::EMPTY,
+                        address: IpAddr::V4(vip1),
+                    },
+                    Some(&"ns".into())
+                )
                 .unwrap()),
         );
 
@@ -1221,6 +1250,7 @@ mod tests {
                     addresses: vec![XdsNetworkAddress {
                         network: "".to_string(),
                         address: vip1.octets().to_vec(),
+                        length: None,
                     }],
                     ports: vec![XdsPort {
                         service_port: 80,
@@ -1228,10 +1258,12 @@ mod tests {
                     }],
                     subject_alt_names: vec![],
                     waypoint: None,
+                    weighted_waypoints: vec![],
                     load_balancing: None,
                     ip_families: 0,
                     extensions: Default::default(),
                     canonical: true,
+                    visibility: 0,
                 },
             )
             .unwrap();
@@ -1273,10 +1305,13 @@ mod tests {
                 .read()
                 .unwrap()
                 .services
-                .get_by_vip(&NetworkAddress {
-                    network: strng::EMPTY,
-                    address: IpAddr::V4(vip1),
-                })
+                .get_best_by_vip(
+                    &NetworkAddress {
+                        network: strng::EMPTY,
+                        address: IpAddr::V4(vip1),
+                    },
+                    Some(&"ns".into())
+                )
                 .unwrap()),
         );
 
@@ -1300,10 +1335,13 @@ mod tests {
                 .read()
                 .unwrap()
                 .services
-                .get_by_vip(&NetworkAddress {
-                    network: strng::EMPTY,
-                    address: IpAddr::V4(vip1),
-                })
+                .get_best_by_vip(
+                    &NetworkAddress {
+                        network: strng::EMPTY,
+                        address: IpAddr::V4(vip1),
+                    },
+                    Some(&"ns".into())
+                )
                 .unwrap()),
         );
 
@@ -1533,6 +1571,7 @@ mod tests {
                     addresses: vec![XdsNetworkAddress {
                         network: "".to_string(),
                         address: vip1.octets().to_vec(),
+                        length: None,
                     }],
                     ports: vec![XdsPort {
                         service_port: 80,
@@ -1540,10 +1579,12 @@ mod tests {
                     }],
                     subject_alt_names: vec![],
                     waypoint: None,
+                    weighted_waypoints: vec![],
                     load_balancing: None,
                     ip_families: 0,
                     extensions: Default::default(),
                     canonical: true,
+                    visibility: 0,
                 },
             )
             .unwrap();
@@ -1557,6 +1598,7 @@ mod tests {
                     addresses: vec![XdsNetworkAddress {
                         network: "".to_string(),
                         address: vip2.octets().to_vec(),
+                        length: None,
                     }],
                     ports: vec![XdsPort {
                         service_port: 80,
@@ -1564,6 +1606,7 @@ mod tests {
                     }],
                     subject_alt_names: vec![],
                     waypoint: None,
+                    weighted_waypoints: vec![],
                     load_balancing: Some(LoadBalancing {
                         routing_preference: vec![],
                         mode: 0,
@@ -1572,6 +1615,7 @@ mod tests {
                     ip_families: 0,
                     extensions: Default::default(),
                     canonical: true,
+                    visibility: 0,
                 },
             )
             .unwrap();
@@ -1609,6 +1653,7 @@ mod tests {
             addresses: vec![XdsNetworkAddress {
                 network: "".to_string(),
                 address: vip2.octets().to_vec(),
+                length: None,
             }],
             ports: vec![XdsPort {
                 service_port: 80,
@@ -1616,6 +1661,7 @@ mod tests {
             }],
             subject_alt_names: vec![],
             waypoint: None,
+            weighted_waypoints: vec![],
             load_balancing: Some(LoadBalancing {
                 routing_preference: vec![],
                 mode: 0,
@@ -1624,6 +1670,7 @@ mod tests {
             ip_families: 0,
             extensions: Default::default(),
             canonical: true,
+            visibility: 0,
         };
         updater
             .insert_service(
@@ -1635,6 +1682,7 @@ mod tests {
                     addresses: vec![XdsNetworkAddress {
                         network: "".to_string(),
                         address: vip1.octets().to_vec(),
+                        length: None,
                     }],
                     ports: vec![XdsPort {
                         service_port: 80,
@@ -1642,10 +1690,12 @@ mod tests {
                     }],
                     subject_alt_names: vec![],
                     waypoint: None,
+                    weighted_waypoints: vec![],
                     load_balancing: None,
                     ip_families: 0,
                     extensions: Default::default(),
                     canonical: true,
+                    visibility: 0,
                 },
             )
             .unwrap();
