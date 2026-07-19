@@ -82,6 +82,8 @@ pub(super) fn provider() -> Arc<CryptoProvider> {
     if *TLS12_ENABLED {
         // Add TLS 1.2 FIPS-compatible cipher suites
         cipher_suites.extend([
+            rustls::crypto::ring::cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+            rustls::crypto::ring::cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
             rustls::crypto::ring::cipher_suite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
             rustls::crypto::ring::cipher_suite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
         ]);
@@ -101,6 +103,8 @@ pub(super) fn provider() -> Arc<CryptoProvider> {
     if *TLS12_ENABLED {
         // Add TLS 1.2 FIPS-compatible cipher suites
         cipher_suites.extend([
+            rustls::crypto::aws_lc_rs::cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+            rustls::crypto::aws_lc_rs::cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
             rustls::crypto::aws_lc_rs::cipher_suite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
             rustls::crypto::aws_lc_rs::cipher_suite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
         ]);
@@ -126,6 +130,8 @@ pub(super) fn provider() -> Arc<CryptoProvider> {
     if *TLS12_ENABLED {
         // Add TLS 1.2 FIPS-compatible cipher suites
         cipher_suites.extend([
+            rustls_openssl::cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+            rustls_openssl::cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
             rustls_openssl::cipher_suite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
             rustls_openssl::cipher_suite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
         ]);
@@ -158,6 +164,28 @@ pub(super) fn provider() -> Arc<CryptoProvider> {
         kx_groups,
         ..rustls_openssl::default_provider()
     })
+}
+
+/// Returns true if the given [`std::io::Error`] wraps a rustls
+/// [`rustls::CertificateError::Revoked`] error, meaning the TLS peer's certificate (or a
+/// certificate in its chain) was rejected because it appears in a loaded CRL.
+pub fn io_error_is_cert_revoked(e: &std::io::Error) -> bool {
+    e.get_ref()
+        .and_then(|src| src.downcast_ref::<rustls::Error>())
+        .is_some_and(|re| {
+            matches!(
+                re,
+                rustls::Error::InvalidCertificate(rustls::CertificateError::Revoked)
+            )
+        })
+}
+
+/// Returns true if the given [`TlsError`] represents a CRL certificate revocation rejection.
+pub fn tls_error_is_cert_revoked(e: &TlsError) -> bool {
+    match e {
+        TlsError::Handshake(io_err) => io_error_is_cert_revoked(io_err),
+        _ => false,
+    }
 }
 
 #[derive(thiserror::Error, Debug)]

@@ -130,6 +130,9 @@ impl Inbound {
                     let tls = match acceptor.accept(raw_socket).await {
                         Ok(tls) => tls,
                         Err(e) => {
+                            if crate::tls::tls_error_is_cert_revoked(&e) {
+                                pi.metrics.record_crl_rejection(Reporter::destination);
+                            }
                             metrics::log_early_deny(src, dst, Reporter::destination, e);
 
                             return Err::<(), _>(proxy::Error::SelfCall);
@@ -487,8 +490,8 @@ impl Inbound {
         })
     }
 
-    // Selects a service by hostname without the explicit knowledge of the namespace
-    // There is no explicit mapping from hostname to namespace (e.g. foo.com)
+    // Select a service by hostname, preferring one in the namespace of the given workload.
+    // The given workload may be in the perspective of outbound or inbound.
     fn find_service_by_hostname(
         state: &DemandProxyState,
         local_workload: &Workload,
@@ -538,7 +541,7 @@ impl Inbound {
 
             // TODO Allow HBONE address to be a hostname. We have to respect rules about
             // hostname scoping. Can we use the client's namespace here to do that?
-            let hbone_target = state.find_address(hbone_dst)?;
+            let hbone_target = state.find_address(hbone_dst, None)?;
 
             // HBONE target can point to some service or workload. In either case, get the waypoint
             let Some(target_waypoint) = (match hbone_target {
@@ -550,7 +553,8 @@ impl Inbound {
             };
 
             // Resolve the reference from our HBONE target
-            let Some(target_waypoint) = state.find_destination(&target_waypoint.destination) else {
+            let Some(target_waypoint) = state.find_destination(&target_waypoint.destination, None)
+            else {
                 return Some(false);
             };
 
@@ -780,7 +784,7 @@ mod tests {
         rbac::Connection,
         state::{
             self, DemandProxyState, WorkloadInfo,
-            service::{Endpoint, EndpointSet, Service},
+            service::{Endpoint, EndpointSet, Service, Visibility},
             workload::{
                 ApplicationTunnel, GatewayAddress, HealthStatus, InboundProtocol, NetworkAddress,
                 NetworkMode, Workload, application_tunnel::Protocol as AppProtocol,
@@ -1009,6 +1013,7 @@ mod tests {
                 address: vip.parse().unwrap(),
                 network: "".into(),
             }],
+            cidr_vips: vec![],
             ports: std::collections::HashMap::from([(80u16, 8080u16)]),
             endpoints: EndpointSet::from_list([Endpoint {
                 workload_uid: strng::format!("cluster1//v1/Pod/default/{name}"),
@@ -1017,9 +1022,11 @@ mod tests {
             }]),
             subject_alt_names: vec![strng::format!("{name}.default.svc.cluster.local")],
             waypoint: waypoint.service_attached(),
+            weighted_waypoints: vec![],
             load_balancer: None,
             ip_families: None,
             canonical: true,
+            visibility: Visibility::Public,
         });
 
         let workloads = vec![

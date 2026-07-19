@@ -526,7 +526,7 @@ pub enum Error {
     #[error("dns: {0}")]
     Dns(#[from] ProtoError),
     #[error("dns lookup: {0}")]
-    DnsLookup(#[from] hickory_server::authority::LookupError),
+    DnsLookup(#[from] hickory_server::zone_handler::LookupError),
     #[error("dns response had no valid IP addresses")]
     DnsEmpty,
 }
@@ -775,7 +775,10 @@ where
         return false;
     };
 
-    match state.fetch_destination(&gateway_address.destination).await {
+    match state
+        .fetch_destination(&gateway_address.destination, None)
+        .await
+    {
         Some(Address::Workload(wl)) => return predicate(wl.as_ref()),
         Some(Address::Service(svc)) => {
             for ep in svc.endpoints.iter() {
