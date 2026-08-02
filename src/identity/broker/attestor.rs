@@ -39,19 +39,19 @@ use crate::identity::manager::CertRequest;
 /// Fully-qualified protobuf type names used as `Any.type_url` prefixes per
 /// google.protobuf.Any conventions.
 const TYPE_URL_PREFIX: &str = "type.googleapis.com/";
-// The reference messages live in the `spiffe.reference` proto package
-// upstream (go-spiffe exp/proto/spiffe/reference). The SPIRE agent matches
-// the incoming reference by its `google.protobuf.Any` type URL against that
-// package name, so these MUST be `spiffe.reference.*` — even though our
-// vendored `brokerapi.proto` declares the message bodies under the
-// `spiffe.broker` package (the wire bytes are identical; only the type URL
-// string is matched).
+// The reference messages live in the `spiffe.broker` proto package
+// (go-spiffe exp/proto/spiffe/broker), which is what our vendored
+// `brokerapi.proto` declares. The SPIRE agent matches the incoming reference
+// by its `google.protobuf.Any` type URL, comparing against exactly these
+// strings (see pkg/agent/plugin/workloadattestor/k8s/k8s.go), and the
+// operator must additionally opt each one in via the broker's
+// `allowed_reference_types`.
 //
-// Used by the bundle subscriber to attest ztunnel's *own* process by PID
-// when calling `SubscribeToX509Bundles` (independent of how ztunnel attests
-// the workloads it proxies for).
-pub(super) const WORKLOAD_PID_REFERENCE_TYPE: &str = "spiffe.reference.WorkloadPIDReference";
-const KUBERNETES_OBJECT_REFERENCE_TYPE: &str = "spiffe.reference.KubernetesObjectReference";
+// WORKLOAD_PID_REFERENCE_TYPE is used by the bundle subscriber to attest
+// ztunnel's *own* process by PID when calling `SubscribeToX509Bundles`
+// (independent of how ztunnel attests the workloads it proxies for).
+pub(super) const WORKLOAD_PID_REFERENCE_TYPE: &str = "spiffe.broker.WorkloadPIDReference";
+const KUBERNETES_OBJECT_REFERENCE_TYPE: &str = "spiffe.broker.KubernetesObjectReference";
 
 /// Build a `WorkloadReference` for the SPIFFE Broker
 /// `SubscribeToX509SVID` RPC.
