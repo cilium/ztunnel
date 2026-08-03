@@ -14,7 +14,7 @@
 
 use crate::config::ConfigSource;
 use crate::config::{self, RootCert};
-use crate::state::service::{Endpoint, EndpointSet, Service, Visibility};
+use crate::state::service::{Endpoint, EndpointSet, Service};
 use crate::state::workload::InboundProtocol::{HBONE, TCP};
 use crate::state::workload::{
     GatewayAddress, NamespacedHostname, NetworkAddress, Workload, gatewayaddress,
@@ -138,7 +138,7 @@ pub fn test_config_with_port_xds_addr_and_root_cert(
     };
     // Do not let tests use system defaults!
     cfg.dns_resolver_opts = Default::default();
-    cfg.dns_resolver_cfg = ResolverConfig::from_parts(None, vec![], vec![]);
+    cfg.dns_resolver_cfg = ResolverConfig::new();
     cfg
 }
 
@@ -196,16 +196,13 @@ pub fn mock_default_service() -> Service {
         namespace: "default".into(),
         hostname: "defaulthost".into(),
         vips,
-        cidr_vips: vec![],
         ports,
         endpoints,
         subject_alt_names: vec![],
         waypoint: None,
-        weighted_waypoints: vec![],
         load_balancer: None,
         ip_families: None,
         canonical: true,
-        visibility: Visibility::Public,
     }
 }
 
@@ -290,7 +287,6 @@ fn test_custom_svc(
             network: strng::EMPTY,
             address: vip.parse()?,
         }],
-        cidr_vips: vec![],
         ports: HashMap::from([(80u16, echo_port)]),
         endpoints: EndpointSet::from_list([Endpoint {
             workload_uid: format!("cluster1//v1/Pod/default/{workload_name}").into(),
@@ -299,11 +295,9 @@ fn test_custom_svc(
         }]),
         subject_alt_names: vec!["spiffe://cluster.local/ns/default/sa/default".into()],
         waypoint: None,
-        weighted_waypoints: vec![],
         load_balancer: None,
         ip_families: None,
         canonical: true,
-        visibility: Visibility::Public,
     })
 }
 

@@ -16,9 +16,11 @@ use anyhow::Result;
 use byteorder::{BigEndian, ByteOrder};
 
 use crate::dns::resolver::Resolver;
-use hickory_net::xfer::Protocol;
-use hickory_proto::op::{Message, MessageType, OpCode, Query};
+use hickory_proto::op::{Message, MessageType, Query};
 use hickory_proto::rr::{Name, RecordType};
+use hickory_proto::serialize::binary::BinDecodable;
+use hickory_proto::xfer::Protocol;
+use hickory_server::authority::MessageRequest;
 use hickory_server::server::Request;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -74,8 +76,6 @@ impl Socks5 {
             self.pi.cfg.clone(),
             self.pi.socket_factory.clone(),
             self.pi.local_workload_information.clone(),
-            self.pi.crl_manager.clone(),
-            self.pi.metrics.clone(),
         );
         let accept = async move |drain: DrainWatcher, force_shutdown: watch::Receiver<()>| {
             loop {
@@ -195,9 +195,10 @@ async fn negotiate_socks_connection(
     let nmethods = version[1];
 
     if nmethods == 0 {
-        return Err(SocksError::invalid_protocol(
-            "methods cannot be zero".to_string(),
-        ));
+        return Err(SocksError::invalid_protocol(format!(
+            "methods cannot be zero {}",
+            version[0]
+        )));
     }
 
     // List of supported auth methods
@@ -296,8 +297,10 @@ async fn dns_lookup(
     hostname: &str,
 ) -> Result<IpAddr, Error> {
     fn new_message(name: Name, rr_type: RecordType) -> Message {
-        let mut msg = Message::new(rand::random(), MessageType::Query, OpCode::Query);
-        msg.metadata.recursion_desired = true;
+        let mut msg = Message::new();
+        msg.set_id(rand::random());
+        msg.set_message_type(MessageType::Query);
+        msg.set_recursion_desired(true);
         msg.add_query(Query::query(name, rr_type));
         msg
     }
@@ -305,7 +308,8 @@ async fn dns_lookup(
     /// the client IP and protocol.
     fn server_request(msg: &Message, client_addr: SocketAddr, protocol: Protocol) -> Request {
         let wire_bytes = msg.to_vec().unwrap();
-        Request::from_bytes(wire_bytes, client_addr, protocol).unwrap()
+        let msg_request = MessageRequest::from_bytes(&wire_bytes).unwrap();
+        Request::new(msg_request, client_addr, protocol)
     }
 
     /// Creates a A-record [Request] for the given name.
@@ -327,14 +331,14 @@ async fn dns_lookup(
     } else {
         aaaa_request(name, client_addr, Protocol::Udp)
     };
-    let response = resolver.lookup(&req).await?;
-    let addrs = response
-        .answers()
-        .filter_map(|rec| rec.data.ip_addr())
+    let answer = resolver.lookup(&req).await?;
+    let response = answer
+        .record_iter()
+        .filter_map(|rec| rec.data().ip_addr())
         .next() // TODO: do not always use the first result
         .ok_or_else(|| Error::DnsEmpty)?;
 
-    Ok(addrs)
+    Ok(response)
 }
 
 /// send_error sends an error back to the SOCKS client

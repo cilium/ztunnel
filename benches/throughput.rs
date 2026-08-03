@@ -11,7 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-mod profiler;
 
 use std::cmp::Ordering::{Equal, Greater, Less};
 use std::future::Future;
@@ -28,7 +27,7 @@ use criterion::{
     BenchmarkGroup, Criterion, SamplingMode, Throughput, criterion_group, criterion_main,
 };
 use hickory_resolver::config::{ResolverConfig, ResolverOpts};
-use profiler::{Output, PProfProfiler};
+use pprof::criterion::{Output, PProfProfiler};
 use prometheus_client::registry::Registry;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -55,7 +54,7 @@ const N_RULES: usize = 10;
 const N_POLICIES: usize = 10_000;
 const DUMMY_NETWORK: &str = "198.51.100.0/24";
 
-#[ctor::ctor(unsafe)]
+#[ctor::ctor]
 fn initialize_namespace_tests() {
     ztunnel::test_helpers::namespaced::initialize_namespace_tests();
 }

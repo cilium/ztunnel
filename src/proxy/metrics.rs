@@ -48,8 +48,6 @@ pub struct Metrics {
 
     // on-demand DNS is not a part of DNS proxy, but part of ztunnel proxy itself
     pub on_demand_dns: Family<OnDemandDnsLabels, Counter>,
-
-    pub crl_policy_rejections: Family<CrlRejectionLabels, Counter>,
 }
 
 #[derive(Clone, Copy, Default, Debug, Hash, PartialEq, Eq, EncodeLabelValue)]
@@ -245,11 +243,6 @@ pub struct SocketLabels {
     pub reporter: Reporter,
 }
 
-#[derive(Clone, Copy, Hash, Default, Debug, PartialEq, Eq, EncodeLabelSet)]
-pub struct CrlRejectionLabels {
-    pub reporter: Reporter,
-}
-
 #[derive(Clone, Hash, Default, Debug, PartialEq, Eq, EncodeLabelSet)]
 pub struct CommonTrafficLabels {
     reporter: Reporter,
@@ -392,13 +385,6 @@ impl Metrics {
             open_sockets.clone(),
         );
 
-        let crl_policy_rejections = Family::default();
-        registry.register(
-            "crl_policy_rejections",
-            "The total number of connections rejected due to CRL certificate revocation (unstable)",
-            crl_policy_rejections.clone(),
-        );
-
         Self {
             connection_opens,
             connection_close,
@@ -407,7 +393,6 @@ impl Metrics {
             on_demand_dns,
             connection_failures,
             open_sockets,
-            crl_policy_rejections,
         }
     }
 
@@ -417,12 +402,6 @@ impl Metrics {
 
     pub fn record_socket_close(&self, labels: &SocketLabels) {
         self.open_sockets.get_or_create(labels).dec();
-    }
-
-    pub fn record_crl_rejection(&self, reporter: Reporter) {
-        self.crl_policy_rejections
-            .get_or_create(&CrlRejectionLabels { reporter })
-            .inc();
     }
 }
 

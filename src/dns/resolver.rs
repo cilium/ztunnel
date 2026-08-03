@@ -14,8 +14,8 @@
 
 use hickory_proto::rr::Record;
 use hickory_resolver::lookup::Lookup;
+use hickory_server::authority::LookupError;
 use hickory_server::server::Request;
-use hickory_server::zone_handler::LookupError;
 use std::slice::Iter;
 
 /// Similar to a TrustDNS `Authority`, although the resulting [Answer] indicates whether
@@ -24,33 +24,27 @@ use std::slice::Iter;
 /// may not.
 #[async_trait::async_trait]
 pub trait Resolver: Sync + Send {
-    async fn lookup(&self, request: &Request) -> Result<Response, LookupError>;
+    async fn lookup(&self, request: &Request) -> Result<Answer, LookupError>;
 }
 
 /// Answer returned by a [Resolver].
 #[derive(Debug)]
-pub struct Response {
-    answers: Vec<Record>,
-    additionals: Vec<Record>,
+pub struct Answer {
+    records: Vec<Record>,
     is_authoritative: bool,
 }
 
-impl Response {
-    pub fn new(answers: Vec<Record>, additionals: Vec<Record>, is_authoritative: bool) -> Self {
+impl Answer {
+    pub fn new(records: Vec<Record>, is_authoritative: bool) -> Self {
         Self {
-            answers,
-            additionals,
+            records,
             is_authoritative,
         }
     }
 
     /// Returns an iterator over the records returned by the [Resolver].
-    pub fn answers(&self) -> RecordIter<'_> {
-        RecordIter(self.answers.iter())
-    }
-
-    pub fn additionals(&self) -> RecordIter<'_> {
-        RecordIter(self.additionals.iter())
+    pub fn record_iter(&self) -> RecordIter<'_> {
+        RecordIter(self.records.iter())
     }
 
     /// Indicates whether the [Resolver] is the authority for the returned records.
@@ -59,11 +53,10 @@ impl Response {
     }
 }
 
-impl From<Lookup> for Response {
+impl From<Lookup> for Answer {
     fn from(value: Lookup) -> Self {
         Self {
-            answers: value.answers().to_vec(),
-            additionals: value.additionals().to_vec(),
+            records: value.records().to_vec(),
             is_authoritative: false, // Non-authoritative, since results came from upstream resolver.
         }
     }

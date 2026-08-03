@@ -84,8 +84,6 @@ impl Outbound {
             self.pi.cfg.clone(),
             self.pi.socket_factory.clone(),
             self.pi.local_workload_information.clone(),
-            self.pi.crl_manager.clone(),
-            self.pi.metrics.clone(),
         );
         let pi = self.pi.clone();
         let accept = async move |drain: DrainWatcher, force_shutdown: watch::Receiver<()>| {
@@ -275,15 +273,8 @@ impl OutboundConnection {
                 .local_workload_information
                 .fetch_certificate()
                 .await?;
-            let connector =
-                cert.outbound_connector(wl_key.dst_id.clone(), self.pi.crl_manager.clone())?;
-            let tls_stream = connector.connect(upgraded).await.inspect_err(|e| {
-                if crate::tls::io_error_is_cert_revoked(e) {
-                    self.pi
-                        .metrics
-                        .record_crl_rejection(crate::proxy::metrics::Reporter::source);
-                }
-            })?;
+            let connector = cert.outbound_connector(wl_key.dst_id.clone())?;
+            let tls_stream = connector.connect(upgraded).await?;
             let (_, ssl) = tls_stream.get_ref();
             let peer_identity = identity_from_connection(ssl);
 
@@ -553,13 +544,10 @@ impl OutboundConnection {
         // If this is to-service traffic check for a service waypoint
         // Capture result of whether this is svc addressed
         let service = if let Some(Address::Service(target_service)) = state
-            .fetch_address(
-                &NetworkAddress {
-                    network: self.pi.cfg.network.clone(),
-                    address: target.ip(),
-                },
-                Some(&source_workload.namespace),
-            )
+            .fetch_address(&NetworkAddress {
+                network: self.pi.cfg.network.clone(),
+                address: target.ip(),
+            })
             .await
         {
             // if we have a waypoint for this svc, use it; otherwise route traffic normally
@@ -899,8 +887,6 @@ mod tests {
                 cfg.clone(),
                 sock_fact,
                 local_workload_information.clone(),
-                None,
-                test_proxy_metrics(),
             ),
             hbone_port: cfg.inbound_addr.port(),
         };
@@ -964,7 +950,6 @@ mod tests {
                     addresses: vec![XdsNetworkAddress {
                         network: "".to_string(),
                         address: vec![127, 0, 0, 3],
-                        length: None,
                     }],
                     ports: vec![Port {
                         service_port: 80,
@@ -1006,7 +991,6 @@ mod tests {
                     addresses: vec![XdsNetworkAddress {
                         network: "".to_string(),
                         address: vec![127, 0, 0, 3],
-                        length: None,
                     }],
                     ports: vec![Port {
                         service_port: 80,
@@ -1024,7 +1008,6 @@ mod tests {
                                 XdsNetworkAddress {
                                     network: "remote".to_string(),
                                     address: vec![10, 22, 1, 1],
-                                    length: None,
                                 },
                             ),
                         ),
@@ -1066,7 +1049,6 @@ mod tests {
                     addresses: vec![XdsNetworkAddress {
                         network: "".to_string(),
                         address: vec![127, 0, 0, 3],
-                        length: None,
                     }],
                     ports: vec![Port {
                         service_port: 80,
@@ -1079,7 +1061,6 @@ mod tests {
                     addresses: vec![XdsNetworkAddress {
                         network: "".to_string(),
                         address: vec![127, 0, 0, 4],
-                        length: None,
                     }],
                     ports: vec![Port {
                         service_port: 15009,
@@ -1147,7 +1128,6 @@ mod tests {
                     addresses: vec![XdsNetworkAddress {
                         network: "".to_string(),
                         address: vec![127, 0, 0, 3],
-                        length: None,
                     }],
                     ports: vec![Port {
                         service_port: 80,
@@ -1171,7 +1151,6 @@ mod tests {
                     addresses: vec![XdsNetworkAddress {
                         network: "".to_string(),
                         address: vec![127, 0, 0, 4],
-                        length: None,
                     }],
                     ports: vec![Port {
                         service_port: 15008,
@@ -1189,7 +1168,6 @@ mod tests {
                                 XdsNetworkAddress {
                                     network: "remote".to_string(),
                                     address: vec![10, 22, 1, 1],
-                                    length: None,
                                 },
                             ),
                         ),
@@ -1232,7 +1210,6 @@ mod tests {
             addresses: vec![XdsNetworkAddress {
                 network: "".to_string(),
                 address: vec![127, 0, 0, 3],
-                length: None,
             }],
             ports: vec![Port {
                 service_port: 80,
@@ -1264,7 +1241,6 @@ mod tests {
                     XdsNetworkAddress {
                         network: "remote".to_string(),
                         address: vec![10, 22, 1, 1],
-                        length: None,
                     },
                 )),
                 hbone_mtls_port: 15009,
@@ -1455,7 +1431,6 @@ mod tests {
                         XdsNetworkAddress {
                             network: "".to_string(),
                             address: [127, 0, 0, 10].to_vec(),
-                            length: None,
                         },
                     )),
                     hbone_mtls_port: 15008,
@@ -1485,7 +1460,6 @@ mod tests {
                         XdsNetworkAddress {
                             network: "".to_string(),
                             address: [127, 0, 0, 10].to_vec(),
-                            length: None,
                         },
                     )),
                     hbone_mtls_port: 15008,
@@ -1520,7 +1494,6 @@ mod tests {
                         XdsNetworkAddress {
                             network: "".to_string(),
                             address: [127, 0, 0, 11].to_vec(),
-                            length: None,
                         },
                     )),
                     hbone_mtls_port: 15008,
@@ -1546,7 +1519,6 @@ mod tests {
                 addresses: vec![XdsNetworkAddress {
                     network: "".to_string(),
                     address: vec![127, 0, 0, 3],
-                    length: None,
                 }],
                 ports: vec![Port {
                     service_port: 80,
@@ -1557,7 +1529,6 @@ mod tests {
                         XdsNetworkAddress {
                             network: "".to_string(),
                             address: [127, 0, 0, 10].to_vec(),
-                            length: None,
                         },
                     )),
                     hbone_mtls_port: 15008,
@@ -1583,7 +1554,6 @@ mod tests {
                 addresses: vec![XdsNetworkAddress {
                     network: "".to_string(),
                     address: vec![127, 0, 0, 3],
-                    length: None,
                 }],
                 ports: vec![Port {
                     service_port: 80,
@@ -1608,7 +1578,6 @@ mod tests {
                     addresses: vec![XdsNetworkAddress {
                         network: "".to_string(),
                         address: vec![127, 0, 0, 3],
-                        length: None,
                     }],
                     ports: vec![
                         Port {
@@ -1670,7 +1639,6 @@ mod tests {
                 addresses: vec![XdsNetworkAddress {
                     network: "".to_string(),
                     address: vec![127, 0, 0, 3],
-                    length: None,
                 }],
                 ports: vec![Port {
                     service_port: 80,
@@ -1804,12 +1772,10 @@ mod tests {
                     XdsNetworkAddress {
                         network: "".to_string(),
                         address: vec![127, 0, 0, 3],
-                        length: None,
                     },
                     XdsNetworkAddress {
                         network: "".to_string(),
                         address: "::3".parse::<Ipv6Addr>().unwrap().octets().into(),
-                        length: None,
                     },
                 ],
                 ports: vec![Port {
@@ -1887,12 +1853,10 @@ mod tests {
                     XdsNetworkAddress {
                         network: "".to_string(),
                         address: vec![1, 2, 3, 4],
-                        length: None,
                     },
                     XdsNetworkAddress {
                         network: "".to_string(),
                         address: vec![1, 5, 6, 7],
-                        length: None,
                     },
                 ],
                 ports: vec![Port {
@@ -1922,7 +1886,6 @@ mod tests {
                         XdsNetworkAddress {
                             network: "".to_string(),
                             address: [127, 0, 0, 10].to_vec(),
-                            length: None,
                         },
                     )),
                     hbone_mtls_port: 15008,
@@ -1935,12 +1898,10 @@ mod tests {
                     XdsNetworkAddress {
                         network: "".to_string(),
                         address: vec![1, 2, 3, 4],
-                        length: None,
                     },
                     XdsNetworkAddress {
                         network: "".to_string(),
                         address: vec![1, 5, 6, 7],
-                        length: None,
                     },
                 ],
                 ports: vec![Port {
@@ -2034,8 +1995,6 @@ mod tests {
                 cfg.clone(),
                 sock_fact,
                 local_workload_information.clone(),
-                None,
-                test_proxy_metrics(),
             ),
             hbone_port: cfg.inbound_addr.port(),
         };
