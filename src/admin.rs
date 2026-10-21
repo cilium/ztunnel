@@ -14,7 +14,7 @@
 
 use crate::config::Config;
 use crate::hyper_util::{Server, empty_response, plaintext_response};
-use crate::identity::SecretManager;
+use crate::identity::{CacheKey, SecretManager};
 use crate::state::DemandProxyState;
 use crate::tls::Certificate;
 use crate::version::BuildInfo;
@@ -84,6 +84,10 @@ pub struct CertDump {
 #[serde(rename_all = "camelCase")]
 pub struct CertsDump {
     identity: String,
+    // Pod UID, set only for workload-keyed cache entries. It separates rows
+    // that share an identity.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    uid: Option<String>,
     state: String,
     cert_chain: Vec<CertDump>,
     root_certs: Vec<CertDump>,
@@ -128,6 +132,8 @@ impl Service {
                 "/debug/pprof/profile" => handle_pprof(req).await,
                 #[cfg(target_os = "linux")]
                 "/debug/pprof/heap" => handle_jemalloc_pprof_heapgen(req).await,
+                #[cfg(target_os = "linux")]
+                "/debug/pprof/heap/profiling" => handle_jemalloc_prof_toggle(req).await,
                 "/quitquitquit" => Ok(handle_server_shutdown(
                     state.shutdown_trigger.clone(),
                     req,
@@ -159,11 +165,16 @@ async fn handle_dashboard(_req: Request<Incoming>) -> Response<Full<Bytes>> {
     let apis = &[
         (
             "debug/pprof/profile",
-            "build profile using the pprof profiler (if supported)",
+            "capture a CPU profile (if supported); \
+             params: seconds (1-300, default 10), frequency in Hz (1-1000, default 100)",
         ),
         (
             "debug/pprof/heap",
             "collect heap profiling data (if supported, requires jmalloc)",
+        ),
+        (
+            "debug/pprof/heap/profiling",
+            "query or toggle heap profiling with ?activate=true|false (requires jmalloc)",
         ),
         ("quitquitquit", "shut down the server"),
         ("config_dump", "dump the current Ztunnel configuration"),
@@ -210,9 +221,13 @@ fn dump_cert(cert: &Certificate) -> CertDump {
 
 async fn dump_certs(cert_manager: &SecretManager) -> Vec<CertsDump> {
     let mut dump = cert_manager
-        .collect_certs(|id, certs| {
+        .collect_certs(|key, certs| {
             let mut dump = CertsDump {
-                identity: id.to_string(),
+                identity: key.identity().to_string(),
+                uid: match key {
+                    CacheKey::Identity(_) => None,
+                    CacheKey::Workload { uid, .. } => Some(uid.to_string()),
+                },
                 ..Default::default()
             };
             use crate::identity::CertState::*;
@@ -232,20 +247,53 @@ async fn dump_certs(cert_manager: &SecretManager) -> Vec<CertsDump> {
             dump
         })
         .await;
-    // Sort for determinism.
-    dump.sort_by(|a, b| a.identity.cmp(&b.identity));
+    // Sort for determinism. The uid breaks ties between same-identity entries.
+    dump.sort_by(|a, b| a.identity.cmp(&b.identity).then_with(|| a.uid.cmp(&b.uid)));
     dump
 }
 
 #[cfg(target_os = "linux")]
-async fn handle_pprof(_req: Request<Incoming>) -> anyhow::Result<Response<Full<Bytes>>> {
+async fn handle_pprof(req: Request<Incoming>) -> anyhow::Result<Response<Full<Bytes>>> {
+    let qp: HashMap<String, String> = req
+        .uri()
+        .query()
+        .map(|v| {
+            url::form_urlencoded::parse(v.as_bytes())
+                .into_owned()
+                .collect()
+        })
+        .unwrap_or_default();
+    let seconds = match qp.get("seconds").map(|s| s.parse::<u64>()) {
+        None => 10,
+        Some(Ok(s)) if (1..=300).contains(&s) => s,
+        Some(_) => {
+            return Ok(plaintext_response(
+                hyper::StatusCode::BAD_REQUEST,
+                "invalid seconds value; expected 1-300\n".into(),
+            ));
+        }
+    };
+    // Default matches Go's CPU profiler. Higher rates severely under-report on a
+    // multi-core-busy process: SIGPROF is non-queuing, so expirations coalesce, and
+    // pprof-rs's handler serializes all threads through one lock and drops samples
+    // that arrive while it is held.
+    let frequency = match qp.get("frequency").map(|s| s.parse::<i32>()) {
+        None => 100,
+        Some(Ok(f)) if (1..=1000).contains(&f) => f,
+        Some(_) => {
+            return Ok(plaintext_response(
+                hyper::StatusCode::BAD_REQUEST,
+                "invalid frequency value; expected 1-1000\n".into(),
+            ));
+        }
+    };
+
     use pprof::protos::Message;
     let guard = pprof::ProfilerGuardBuilder::default()
-        .frequency(1000)
-        // .blocklist(&["libc", "libgcc", "pthread", "vdso"])
+        .frequency(frequency)
         .build()?;
 
-    tokio::time::sleep(Duration::from_secs(10)).await;
+    tokio::time::sleep(Duration::from_secs(seconds)).await;
     let report = guard.report().build()?;
     let profile = report.pprof()?;
 
@@ -410,14 +458,17 @@ async fn handle_jemalloc_pprof_heapgen(
     let Some(prof_ctrl) = jemalloc_pprof::PROF_CTL.as_ref() else {
         return Ok(Response::builder()
             .status(hyper::StatusCode::INTERNAL_SERVER_ERROR)
-            .body("jemalloc profiling is not enabled".into())
+            .body("heap profiling is not enabled".into())
             .expect("builder with known status code should not fail"));
     };
     let mut prof_ctl = prof_ctrl.lock().await;
     if !prof_ctl.activated() {
         return Ok(Response::builder()
             .status(hyper::StatusCode::INTERNAL_SERVER_ERROR)
-            .body("jemalloc not enabled".into())
+            .body(
+                "heap profiling not active; activate with /debug/pprof/heap/profiling?activate=true"
+                    .into(),
+            )
             .expect("builder with known status code should not fail"));
     }
     let pprof = prof_ctl.dump_pprof()?;
@@ -429,6 +480,55 @@ async fn handle_jemalloc_pprof_heapgen(
 
 #[cfg(not(feature = "jemalloc"))]
 async fn handle_jemalloc_pprof_heapgen(
+    _req: Request<Incoming>,
+) -> anyhow::Result<Response<Full<Bytes>>> {
+    Ok(Response::builder()
+        .status(hyper::StatusCode::INTERNAL_SERVER_ERROR)
+        .body("jemalloc not enabled".into())
+        .expect("builder with known status code should not fail"))
+}
+
+#[cfg(all(feature = "jemalloc", target_os = "linux"))]
+async fn handle_jemalloc_prof_toggle(
+    req: Request<Incoming>,
+) -> anyhow::Result<Response<Full<Bytes>>> {
+    let Some(prof_ctrl) = jemalloc_pprof::PROF_CTL.as_ref() else {
+        return Ok(Response::builder()
+            .status(hyper::StatusCode::INTERNAL_SERVER_ERROR)
+            .body("jemalloc profiling is not enabled".into())
+            .expect("builder with known status code should not fail"));
+    };
+    let qp: HashMap<String, String> = req
+        .uri()
+        .query()
+        .map(|v| {
+            url::form_urlencoded::parse(v.as_bytes())
+                .into_owned()
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut prof_ctl = prof_ctrl.lock().await;
+    // Dumps from /debug/pprof/heap only include allocations sampled while
+    // profiling is active; allocations made before activation are not visible.
+    match qp.get("activate").map(String::as_str) {
+        Some("true") => prof_ctl.activate()?,
+        Some("false") => prof_ctl.deactivate()?,
+        Some(v) => {
+            return Ok(plaintext_response(
+                hyper::StatusCode::BAD_REQUEST,
+                format!("invalid activate value {v:?}; expected true or false\n"),
+            ));
+        }
+        None => {}
+    }
+    Ok(plaintext_response(
+        hyper::StatusCode::OK,
+        format!("heap profiling active: {}\n", prof_ctl.activated()),
+    ))
+}
+
+#[cfg(not(feature = "jemalloc"))]
+async fn handle_jemalloc_prof_toggle(
     _req: Request<Incoming>,
 ) -> anyhow::Result<Response<Full<Bytes>>> {
     Ok(Response::builder()
@@ -523,14 +623,11 @@ mod tests {
         });
         for i in 0..2 {
             manager
-                .fetch_certificate(
-                    &identity::Identity::Spiffe {
-                        trust_domain: "trust_domain".into(),
-                        namespace: "namespace".into(),
-                        service_account: strng::format!("sa-{i}"),
-                    }
-                    .to_composite_id(),
-                )
+                .fetch_certificate(&identity::Identity::Spiffe {
+                    trust_domain: "trust_domain".into(),
+                    namespace: "namespace".into(),
+                    service_account: strng::format!("sa-{i}"),
+                })
                 .await
                 .unwrap();
             // Make sure certificates are a significant amount of time apart, for better
@@ -539,9 +636,7 @@ mod tests {
         }
 
         manager
-            .fetch_certificate(
-                &identity("spiffe://error/ns/forgotten/sa/sa-failed").to_composite_id(),
-            )
+            .fetch_certificate(&identity("spiffe://error/ns/forgotten/sa/sa-failed"))
             .await
             .unwrap_err();
 
@@ -549,9 +644,7 @@ mod tests {
         let pending_manager = manager.clone();
         let pending_fetch = tokio::task::spawn(async move {
             pending_manager
-                .fetch_certificate(
-                    &identity("spiffe://test/ns/test/sa/sa-pending").to_composite_id(),
-                )
+                .fetch_certificate(&identity("spiffe://test/ns/test/sa/sa-pending"))
                 .await
         });
         tokio::time::sleep(Duration::from_nanos(1)).await;
@@ -662,6 +755,7 @@ mod tests {
                     ports: vec![XdsPort {
                         service_port: 80,
                         target_port: 8080,
+                        app_protocol: 0,
                     }],
                 },
             )]),
@@ -687,6 +781,7 @@ mod tests {
             ports: vec![XdsPort {
                 service_port: 80,
                 target_port: 80,
+                app_protocol: 0,
             }],
             subject_alt_names: vec!["SAN1".to_string(), "SAN2".to_string()],
             waypoint: None,
@@ -700,6 +795,7 @@ mod tests {
             extensions: Default::default(),
             canonical: true,
             visibility: 0,
+            ingress_use_waypoint: false,
         };
 
         let auth = XdsAuthorization {

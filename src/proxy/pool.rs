@@ -99,11 +99,28 @@ impl ConnSpawner {
             }
         })?;
         trace!("connector connected, handshaking");
+        // Enforce CRL revocation on this tunnel for its whole lifetime
+        let revocation = self.crl_manager.as_ref().map(|crl_manager| {
+            let (_, ssl) = tls_stream.get_ref();
+            let peer_identity = {
+                let x509_cert = crate::tls::certificate_from_connection(ssl);
+                crate::tls::identity(&x509_cert)
+            };
+            crl_manager.register(crate::tls::revocation::ConnRegistration::from_conn(
+                ssl,
+                peer_identity,
+                cert.root_store(),
+                webpki::KeyUsage::server_auth(),
+                crate::proxy::metrics::Reporter::source,
+            ))
+        });
         let sender = h2::client::spawn_connection(
             self.cfg.clone(),
             tls_stream,
             self.timeout_rx.clone(),
             key,
+            revocation,
+            Default::default(),
         )
         .await?;
         Ok(sender)
@@ -384,7 +401,6 @@ impl WorkloadHBONEPool {
         request: http::Request<()>,
     ) -> Result<(H2Stream, Option<Baggage>), Error> {
         let mut connection = self.connect(workload_key).await?;
-
         connection.send_request(request).await
     }
 
