@@ -14,7 +14,8 @@
 
 use crate::{
     config::Config,
-    identity::{CompositeId, Error, Identity, PidClientTrait},
+    container_runtime::ContainerRuntimeManager,
+    identity::{CacheKey, Error, Identity, SecretManager},
     inpod::WorkloadUid,
     tls,
 };
@@ -66,6 +67,26 @@ impl DelegatedIdentityApi for DelegatedIdentityClient {
         let stream = self.clone().stream_x509_svids(attest_type).await?;
         Ok(Box::new(stream))
     }
+}
+
+#[derive(
+    Eq, PartialEq, Hash, Debug, Clone, PartialOrd, Ord, serde::Serialize, serde::Deserialize, Copy,
+)]
+pub struct WorkloadPid(i32);
+
+impl WorkloadPid {
+    pub fn new(pid: i32) -> Self {
+        Self(pid)
+    }
+    pub fn into_i32(self) -> i32 {
+        self.0
+    }
+}
+
+#[cfg_attr(test, mockall::automock)]
+#[async_trait]
+pub trait PidClientTrait: Send + Sync {
+    async fn fetch_pid(&self, uid: &WorkloadUid) -> Result<WorkloadPid, std::io::Error>;
 }
 
 /// SPIRE client that fetches X.509 certificates for workload identities using
@@ -120,10 +141,11 @@ impl<C: DelegatedIdentityApi> SpireClient<C> {
     async fn get_cert_by_pid(
         &self,
         pid: i32,
-        id: &CompositeId<WorkloadUid>,
+        id: &Identity,
+        uid: &WorkloadUid,
     ) -> Result<tls::WorkloadCertificate, Error> {
         let certs = self
-            .get_cert_from_spire(DelegateAttestationRequest::Pid(pid), id.clone())
+            .get_cert_from_spire(DelegateAttestationRequest::Pid(pid), id)
             .await;
 
         let certs = match certs {
@@ -137,14 +159,14 @@ impl<C: DelegatedIdentityApi> SpireClient<C> {
         };
 
         // Verify that the PID we used for attestation matches the PID associated with the workload UID
-        let pid_verify = self.pid.fetch_pid(id.key()).await;
+        let pid_verify = self.pid.fetch_pid(uid).await;
 
         match pid_verify {
             Ok(fetched_pid) => {
                 if fetched_pid.into_i32() != pid {
                     return Err(Error::UnableToDeterminePidForWorkload(format!(
                         "PID mismatch for workload UID {}: expected {}, got {}",
-                        id.key().clone().into_string(),
+                        uid.clone().into_string(),
                         pid,
                         fetched_pid.into_i32()
                     )));
@@ -153,7 +175,7 @@ impl<C: DelegatedIdentityApi> SpireClient<C> {
             }
             Err(e) => Err(Error::UnableToDeterminePidForWorkload(format!(
                 "Failed to verify PID for workload UID {}: {}",
-                id.key().clone().into_string(),
+                uid.clone().into_string(),
                 e
             ))),
         }
@@ -172,18 +194,19 @@ impl<C: DelegatedIdentityApi> SpireClient<C> {
     /// no certificates are received within timeout, or certificate construction fails.
     async fn get_cert_by_workload_uid(
         &self,
-        id: &CompositeId<WorkloadUid>,
+        id: &Identity,
+        uid: &WorkloadUid,
     ) -> Result<tls::WorkloadCertificate, Error> {
         tracing::info!(
             "Fetching PID for workload UID: {}",
-            id.key().clone().into_string()
+            uid.clone().into_string()
         );
-        let pid = self.pid.fetch_pid(id.key()).await;
+        let pid = self.pid.fetch_pid(uid).await;
         match pid {
-            Ok(pid) => self.get_cert_by_pid(pid.into_i32(), id).await,
+            Ok(pid) => self.get_cert_by_pid(pid.into_i32(), id, uid).await,
             Err(e) => Err(Error::UnableToDeterminePidForWorkload(format!(
                 "Failed to fetch PID for workload UID {}: {}",
-                id.key().clone().into_string(),
+                uid.clone().into_string(),
                 e
             ))),
         }
@@ -263,7 +286,7 @@ impl<C: DelegatedIdentityApi> SpireClient<C> {
     async fn get_cert_from_spire(
         &self,
         value: DelegateAttestationRequest,
-        id: CompositeId<WorkloadUid>,
+        id: &Identity,
     ) -> Result<tls::WorkloadCertificate, Error> {
         // Handle nested Result types from timeout + stream operations
         let svid_response = self.subscribe_and_wait_for_workload_cert(value).await?;
@@ -281,11 +304,10 @@ impl<C: DelegatedIdentityApi> SpireClient<C> {
         );
 
         // Validate that the returned identity matches the requested one
-        if id.id().to_string() != Identity::from_str(&id_strg)?.to_string() {
+        if id.to_string() != Identity::from_str(&id_strg)?.to_string() {
             return Err(Error::Spiffe(format!(
                 "Mismatched identity: expected {}, got {}",
-                id.id(),
-                id_strg
+                id, id_strg
             )));
         }
 
@@ -336,21 +358,46 @@ impl<C: DelegatedIdentityApi> SpireClient<C> {
 /// interchangeably with other certificate authority implementations.
 #[async_trait]
 impl<C: DelegatedIdentityApi> crate::identity::CaClientTrait for SpireClient<C> {
-    type Key = WorkloadUid;
+    /// Fetches a certificate for one workload. This is the main integration
+    /// point with ztunnel's certificate manager.
+    ///
+    /// SPIRE attests the pod by PID, so the fetch must carry the pod UID. An
+    /// identity-keyed fetch fails closed.
+    async fn fetch_certificate(&self, key: &CacheKey) -> Result<tls::WorkloadCertificate, Error> {
+        match key {
+            CacheKey::Workload { id, uid, .. } => {
+                self.get_cert_by_workload_uid(id, &WorkloadUid::new(uid.to_string()))
+                    .await
+            }
+            CacheKey::Identity(_) => Err(Error::InvalidConfiguration(
+                "expected Workload key for SPIRE attestation".to_string(),
+            )),
+        }
+    }
+}
 
-    /// Fetches a certificate for the given identity using SPIRE's selector-based approach.
-    /// This is the main integration point with ztunnel's certificate manager.
-    ///
-    /// # Arguments
-    /// * `id` - Composite identity containing the SPIFFE identity and workload UID key
-    ///
-    /// # Returns
-    /// WorkloadCertificate that can be used for TLS operations
-    async fn fetch_certificate(
-        &self,
-        id: &CompositeId<WorkloadUid>,
-    ) -> Result<tls::WorkloadCertificate, Error> {
-        self.get_cert_by_workload_uid(id).await
+impl SecretManager {
+    pub async fn new_with_spire_client<C: 'static + DelegatedIdentityApi>(
+        cfg: Arc<Config>,
+        dc: C,
+    ) -> Result<Self, spiffe::error::GrpcClientError> {
+        let pid_client = ContainerRuntimeManager::new(&cfg)
+            .await
+            .expect("unable to connect to container runtime");
+
+        let client = SpireClient::new(dc, cfg.cluster_domain.clone(), Box::new(pid_client), cfg);
+
+        Ok(Self::new_with_client(client))
+    }
+
+    pub async fn new_with_spire_client_pid<C: 'static + DelegatedIdentityApi>(
+        cfg: Arc<Config>,
+        dc: C,
+        pid_client: Box<dyn PidClientTrait>,
+    ) -> Result<Self, spiffe::error::GrpcClientError> {
+        let client = SpireClient::new(dc, cfg.cluster_domain.clone(), pid_client, cfg);
+
+        Ok(Self::new_with_client(client))
     }
 }
 
@@ -358,10 +405,7 @@ impl<C: DelegatedIdentityApi> crate::identity::CaClientTrait for SpireClient<C> 
 pub mod spire_tests {
     use crate::config;
     use crate::identity::CaClientTrait;
-    use crate::identity::MockPidClientTrait;
-    use crate::identity::RequestKey;
-    use crate::identity::SecretManager;
-    use crate::identity::WorkloadPid;
+    use crate::state::WorkloadInfo;
 
     use super::*;
     use futures::SinkExt;
@@ -464,9 +508,8 @@ pub mod spire_tests {
 
         let identity =
             Identity::from_parts("example.org".into(), "default".into(), "test-sa".into());
-        let composite_id =
-            CompositeId::with_key(identity.clone(), WorkloadUid::new("uid-123456".to_string()));
-        let result = spire_client.get_cert_by_pid(10, &composite_id).await;
+        let uid = WorkloadUid::new("uid-123456".to_string());
+        let result = spire_client.get_cert_by_pid(10, &identity, &uid).await;
 
         assert!(result.is_ok());
 
@@ -478,7 +521,9 @@ pub mod spire_tests {
 
         assert!(identity.to_string() == "spiffe://example.org/ns/default/sa/test-sa");
 
-        let fetch_result = spire_client.fetch_certificate(&composite_id).await;
+        let fetch_result = spire_client
+            .fetch_certificate(&workload_key(&identity, "uid-123456"))
+            .await;
 
         assert!(fetch_result.is_ok());
     }
@@ -517,9 +562,8 @@ pub mod spire_tests {
 
         let identity =
             Identity::from_parts("example.org".into(), "default".into(), "test-sa".into());
-        let composite_id =
-            CompositeId::with_key(identity.clone(), WorkloadUid::new("uid-123456".to_string()));
-        let result = spire_client.get_cert_by_pid(1337, &composite_id).await;
+        let uid = WorkloadUid::new("uid-123456".to_string());
+        let result = spire_client.get_cert_by_pid(1337, &identity, &uid).await;
 
         assert!(result.is_err());
     }
@@ -559,9 +603,8 @@ pub mod spire_tests {
 
         let identity =
             Identity::from_parts("example.org".into(), "default".into(), "test-sa".into());
-        let composite_id =
-            CompositeId::with_key(identity, WorkloadUid::new("uid-123456".to_string()));
-        let result = spire_client.get_cert_by_pid(10, &composite_id).await;
+        let uid = WorkloadUid::new("uid-123456".to_string());
+        let result = spire_client.get_cert_by_pid(10, &identity, &uid).await;
 
         assert!(result.is_err());
     }
@@ -598,26 +641,29 @@ pub mod spire_tests {
             Arc::clone(&cfg),
         );
 
-        let composite_id = CompositeId::new(
-            Identity::from_parts("example.org".into(), "default".into(), "test-sa".into()),
-            RequestKey::Workload(WorkloadUid::new("uid-123456".to_string())),
-        );
-        let composite_id_diff_uid = CompositeId::new(
-            Identity::from_parts("example.org".into(), "default".into(), "test-sa".into()),
-            RequestKey::Workload(WorkloadUid::new("uid-654321".to_string())),
-        );
+        let identity =
+            Identity::from_parts("example.org".into(), "default".into(), "test-sa".into());
         let sm = SecretManager::new_with_client(spire_client);
-        let certs = sm.fetch_certificate(&composite_id).await.unwrap();
+        let certs = sm
+            .fetch_certificate_by_workload(&identity, test_workload_info(), "uid-123456".into())
+            .await
+            .unwrap();
         assert!(
             certs.identity().unwrap().to_string() == "spiffe://example.org/ns/default/sa/test-sa"
         );
         assert!(sm.cache_len().await == 1);
-        let certs = sm.fetch_certificate(&composite_id).await.unwrap();
+        let certs = sm
+            .fetch_certificate_by_workload(&identity, test_workload_info(), "uid-123456".into())
+            .await
+            .unwrap();
         assert!(
             certs.identity().unwrap().to_string() == "spiffe://example.org/ns/default/sa/test-sa"
         );
         assert!(sm.cache_len().await == 1);
-        let certs = sm.fetch_certificate(&composite_id_diff_uid).await.unwrap();
+        let certs = sm
+            .fetch_certificate_by_workload(&identity, test_workload_info(), "uid-654321".into())
+            .await
+            .unwrap();
         assert!(
             certs.identity().unwrap().to_string() == "spiffe://example.org/ns/default/sa/test-sa"
         );
@@ -659,12 +705,12 @@ pub mod spire_tests {
             Arc::clone(&cfg),
         );
 
-        let composite_id = CompositeId::new(
-            Identity::from_parts("example.org".into(), "default".into(), "test-sa".into()),
-            RequestKey::Workload(WorkloadUid::new("uid-123456".to_string())),
-        );
+        let identity =
+            Identity::from_parts("example.org".into(), "default".into(), "test-sa".into());
         let sm = SecretManager::new_with_client(spire_client);
-        let certs = sm.fetch_certificate(&composite_id).await;
+        let certs = sm
+            .fetch_certificate_by_workload(&identity, test_workload_info(), "uid-123456".into())
+            .await;
         assert!(certs.is_err());
         assert!(sm.cache_len().await == 1);
         let err = certs.err().unwrap().to_string();
@@ -705,9 +751,8 @@ pub mod spire_tests {
 
         let identity =
             Identity::from_parts("example.org".into(), "default".into(), "test-sa".into());
-        let composite_id =
-            CompositeId::with_key(identity.clone(), WorkloadUid::new("uid-123456".to_string()));
-        let result = spire_client.get_cert_by_pid(10, &composite_id).await;
+        let uid = WorkloadUid::new("uid-123456".to_string());
+        let result = spire_client.get_cert_by_pid(10, &identity, &uid).await;
 
         assert!(result.is_ok());
 
@@ -719,7 +764,9 @@ pub mod spire_tests {
 
         assert!(identity.to_string() == "spiffe://example.org/ns/default/sa/test-sa");
 
-        let fetch_result = spire_client.fetch_certificate(&composite_id).await;
+        let fetch_result = spire_client
+            .fetch_certificate(&workload_key(&identity, "uid-123456"))
+            .await;
 
         assert!(fetch_result.is_ok());
     }
@@ -759,9 +806,8 @@ pub mod spire_tests {
 
         let identity =
             Identity::from_parts("example.org".into(), "default".into(), "test-sa".into());
-        let composite_id =
-            CompositeId::with_key(identity, WorkloadUid::new("uid-123456".to_string()));
-        let result = spire_client.get_cert_by_pid(10, &composite_id).await;
+        let uid = WorkloadUid::new("uid-123456".to_string());
+        let result = spire_client.get_cert_by_pid(10, &identity, &uid).await;
 
         assert!(result.is_err());
 
@@ -803,14 +849,29 @@ pub mod spire_tests {
 
         let identity =
             Identity::from_parts("example.org".into(), "default".into(), "test-sa".into());
-        let composite_id =
-            CompositeId::with_key(identity, WorkloadUid::new("uid-123456".to_string()));
-        let result = spire_client.get_cert_by_pid(10, &composite_id).await;
+        let uid = WorkloadUid::new("uid-123456".to_string());
+        let result = spire_client.get_cert_by_pid(10, &identity, &uid).await;
 
         assert!(result.is_err());
 
         let err = result.err().unwrap().to_string();
         assert!(err.contains("Timeout while waiting for SVID stream"));
+    }
+
+    fn test_workload_info() -> Arc<WorkloadInfo> {
+        Arc::new(WorkloadInfo::new(
+            "test-pod".to_string(),
+            "default".to_string(),
+            "test-sa".to_string(),
+        ))
+    }
+
+    fn workload_key(id: &Identity, uid: &str) -> CacheKey {
+        CacheKey::Workload {
+            id: id.clone(),
+            uid: uid.into(),
+            workload: test_workload_info(),
+        }
     }
 
     fn mock_bundle_response() -> spiffe::X509BundleSet {
@@ -910,11 +971,8 @@ pub mod spire_tests {
         // Request certificate for ns/default/sa/test-sa but SPIRE returns ns/other-namespace/sa/other-sa
         let identity =
             Identity::from_parts("example.org".into(), "default".into(), "test-sa".into());
-        let composite_id =
-            CompositeId::with_key(identity, WorkloadUid::new("uid-123456".to_string()));
-
         let result = spire_client
-            .get_cert_from_spire(DelegateAttestationRequest::Pid(10), composite_id)
+            .get_cert_from_spire(DelegateAttestationRequest::Pid(10), &identity)
             .await;
 
         assert!(result.is_err());

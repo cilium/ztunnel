@@ -57,6 +57,8 @@ pub enum Error {
     Forgotten,
     #[error("BUG: identity requested {0}, but only allowed {1:?}")]
     BugInvalidIdentityRequest(Identity, Arc<WorkloadInfo>),
+    #[error("BUG: per-identity CA received a workload-keyed fetch: {0}")]
+    BugWorkloadKeyedFetch(String),
     #[error("failed to fetch bundle for workload: {0}")]
     FailedToFetchBundle(String),
     #[error("certificate is in invalid format")]

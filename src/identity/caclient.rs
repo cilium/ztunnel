@@ -23,8 +23,9 @@ use tonic::metadata::{AsciiMetadataKey, AsciiMetadataValue};
 use tracing::{debug, error, instrument, warn};
 
 use crate::config::RootCert;
+use crate::identity::Error;
 use crate::identity::auth::AuthSource;
-use crate::identity::{CompositeId, Error, Identity};
+use crate::identity::manager::{CacheKey, Identity};
 use crate::tls::{self, RootCertManager, TlsGrpcChannel, control_plane_client_config};
 use crate::xds::istio::ca::IstioCertificateRequest;
 use crate::xds::istio::ca::istio_certificate_service_client::IstioCertificateServiceClient;
@@ -104,10 +105,7 @@ impl CaClient {
 
 impl CaClient {
     #[instrument(skip_all)]
-    async fn fetch_certificate(
-        &self,
-        id: &CompositeId<Identity>,
-    ) -> Result<tls::WorkloadCertificate, Error> {
+    async fn fetch_certificate(&self, id: &Identity) -> Result<tls::WorkloadCertificate, Error> {
         // Hot reload check
         // If the cert has changed since last call, rebuild the channel before making the request.
         // If rebuild fails:
@@ -181,7 +179,7 @@ impl CaClient {
         let leaf = resp
             .cert_chain
             .first()
-            .ok_or_else(|| Error::EmptyResponse(id.id().to_owned()))?
+            .ok_or_else(|| Error::EmptyResponse(id.to_owned()))?
             .as_bytes();
         let chain = if resp.cert_chain.len() > 1 {
             resp.cert_chain[1..].iter().map(|s| s.as_bytes()).collect()
@@ -191,9 +189,9 @@ impl CaClient {
         };
         let certs = tls::WorkloadCertificate::new(&private_key, leaf, chain)?;
         // Make the certificate actually matches the identity we requested.
-        if self.enable_impersonated_identity && certs.identity().as_ref() != Some(id.id()) {
+        if self.enable_impersonated_identity && certs.identity().as_ref() != Some(id) {
             error!("expected identity {:?}, got {:?}", id, certs.identity());
-            return Err(Error::SanError(id.id().to_owned()));
+            return Err(Error::SanError(id.to_owned()));
         }
         Ok(certs)
     }
@@ -201,11 +199,16 @@ impl CaClient {
 
 #[async_trait]
 impl crate::identity::CaClientTrait for CaClient {
-    type Key = Identity;
-    async fn fetch_certificate(
-        &self,
-        id: &CompositeId<Identity>,
-    ) -> Result<tls::WorkloadCertificate, Error> {
+    // Istio CA issues per identity. Only the identity part of the key is used.
+    async fn fetch_certificate(&self, key: &CacheKey) -> Result<tls::WorkloadCertificate, Error> {
+        // Workload-keyed fetches must not reach a per-identity CA. Each pod
+        // would mint a duplicate certificate, so fail closed instead.
+        let id = match key {
+            CacheKey::Identity(id) => id,
+            CacheKey::Workload { .. } => {
+                return Err(Error::BugWorkloadKeyedFetch(key.to_string()));
+            }
+        };
         self.fetch_certificate(id).await
     }
 }
@@ -218,13 +221,13 @@ pub mod mock {
     use tokio::sync::RwLock;
     use tokio::time::Instant;
 
-    use crate::identity::Identity;
+    use crate::identity::{CacheKey, Identity};
 
     use super::*;
 
     #[derive(Default)]
     struct ClientState {
-        fetches: Vec<Identity>,
+        fetches: Vec<CacheKey>,
         error: bool,
         cert_gen: tls::mock::CertGenerator,
     }
@@ -270,7 +273,7 @@ pub mod mock {
         // Returns a list of fetch_certificate calls, in the order they happened. Calls are added
         // just before the function returns (ie. after the potential sleep controlled by the
         // fetch_latency config option).
-        pub async fn fetches(&self) -> Vec<Identity> {
+        pub async fn fetches(&self) -> Vec<CacheKey> {
             self.state.read().await.fetches.clone()
         }
 
@@ -280,13 +283,14 @@ pub mod mock {
 
         async fn fetch_certificate(
             &self,
-            id: &CompositeId<Identity>,
+            key: &CacheKey,
         ) -> Result<tls::WorkloadCertificate, Error> {
+            let id = key.identity();
             let Identity::Spiffe {
                 trust_domain: td,
                 namespace: ns,
                 ..
-            } = id.id();
+            } = id;
             if td == "error" {
                 return Err(match ns.as_str() {
                     "forgotten" => Error::Forgotten,
@@ -307,13 +311,13 @@ pub mod mock {
             let not_after = not_before + self.cfg.cert_lifetime;
 
             let mut state = self.state.write().await;
-            state.fetches.push(id.id().to_owned());
+            state.fetches.push(key.to_owned());
             if state.error {
                 return Err(Error::Spiffe("injected test error".into()));
             }
             let certs = state
                 .cert_gen
-                .new_certs(&id.id().to_owned().into(), not_before, not_after);
+                .new_certs(&id.to_owned().into(), not_before, not_after);
             Ok(certs)
         }
 
@@ -325,12 +329,11 @@ pub mod mock {
 
     #[async_trait]
     impl crate::identity::CaClientTrait for CaClient {
-        type Key = Identity;
         async fn fetch_certificate(
             &self,
-            id: &CompositeId<Identity>,
+            key: &CacheKey,
         ) -> Result<tls::WorkloadCertificate, Error> {
-            self.fetch_certificate(id).await
+            self.fetch_certificate(key).await
         }
     }
 }
@@ -345,23 +348,20 @@ mod tests {
 
     use crate::{
         config::RootCert,
-        identity::{CompositeId, Error, Identity},
+        identity::{CacheKey, Error, Identity},
+        state::WorkloadInfo,
         test_helpers,
         tls::{self, RootCertManager, mock::TEST_ROOT},
         xds::istio::ca::IstioCertificateResponse,
     };
+    use std::sync::Arc;
 
     async fn test_ca_client_with_response(
         res: IstioCertificateResponse,
     ) -> Result<tls::WorkloadCertificate, Error> {
         let (mock, ca_client) = test_helpers::ca::CaServer::spawn().await;
         mock.send(Ok(res)).unwrap();
-        ca_client
-            .fetch_certificate(&CompositeId::with_key(
-                Identity::default(),
-                Identity::default(),
-            ))
-            .await
+        ca_client.fetch_certificate(&Identity::default()).await
     }
 
     #[tokio::test]
@@ -404,6 +404,22 @@ mod tests {
         })
         .await;
         assert_matches!(res, Ok(_));
+    }
+
+    #[tokio::test]
+    async fn workload_keyed_fetch_fails_closed() {
+        let (_mock, ca_client) = test_helpers::ca::CaServer::spawn().await;
+        let key = CacheKey::Workload {
+            id: Identity::default(),
+            uid: "pod-uid".into(),
+            workload: Arc::new(WorkloadInfo::new(
+                "pod".to_string(),
+                "ns".to_string(),
+                "sa".to_string(),
+            )),
+        };
+        let res = crate::identity::CaClientTrait::fetch_certificate(&ca_client, &key).await;
+        assert_matches!(res, Err(Error::BugWorkloadKeyedFetch(_)));
     }
 
     #[test]

@@ -37,13 +37,12 @@ use crate::proxy::{ConnectionOpen, ConnectionResultBuilder, DerivedWorkload, met
 use crate::baggage::{self, Baggage};
 use crate::drain::DrainWatcher;
 use crate::drain::run_with_drain;
-use crate::proxy::h2::{H2Stream, client::WorkloadKey};
+use crate::proxy::h2::{H2Stream, TeardownCause, client::WorkloadKey};
 use crate::state::service::{LoadBalancerMode, Service, ServiceDescription};
 use crate::state::workload::OutboundProtocol;
 use crate::state::workload::{InboundProtocol, NetworkAddress, Workload, address::Address};
 use crate::state::{ServiceResolutionMode, Upstream};
-use crate::tls::identity_from_connection;
-use crate::{assertions, copy, proxy, socket};
+use crate::{assertions, copy, proxy, socket, tls};
 
 use super::h2::TokioH2Stream;
 
@@ -128,7 +127,7 @@ impl Outbound {
                             debug!(component="outbound", dur=?start.elapsed(), "connection completed");
                         }.instrument(span);
 
-                        assertions::size_between_ref(1000, 1750, &serve_outbound_connection);
+                        assertions::size_between_ref(1000, 2100, &serve_outbound_connection);
                         tokio::spawn(serve_outbound_connection);
                     }
                     Err(e) => {
@@ -256,6 +255,9 @@ impl OutboundConnection {
         let res = (async move {
             // Create the outer HBONE stream
             let (upgraded, _) = Box::pin(self.send_hbone_request(remote_addr, req)).await?;
+            // The inner tunnel's streams also report the outer tunnel's teardown, which otherwise
+            // only reaches them as an opaque error from the inner TLS stream.
+            let teardown = TeardownCause::nested(upgraded.teardown_cause());
             // Wrap upgraded to implement tokio's Async{Write,Read}
             let upgraded = TokioH2Stream::new(upgraded);
 
@@ -285,15 +287,30 @@ impl OutboundConnection {
                 }
             })?;
             let (_, ssl) = tls_stream.get_ref();
-            let peer_identity = identity_from_connection(ssl);
+            let peer_identity = {
+                let x509_cert = tls::certificate_from_connection(ssl);
+                tls::identity(&x509_cert)
+            };
 
             // Spawn inner CONNECT tunnel
             let (drain_tx, drain_rx) = tokio::sync::watch::channel(false);
+            // Enforce CRL revocation on this inner tunnel for its lifetime
+            let revocation = self.pi.crl_manager.as_ref().map(|crl_manager| {
+                crl_manager.register(crate::tls::revocation::ConnRegistration::from_conn(
+                    ssl,
+                    peer_identity.clone(),
+                    cert.root_store(),
+                    webpki::KeyUsage::server_auth(),
+                    crate::proxy::metrics::Reporter::source,
+                ))
+            });
             let mut sender = super::h2::client::spawn_connection(
                 self.pi.cfg.clone(),
                 tls_stream,
                 drain_rx,
                 wl_key,
+                revocation,
+                teardown,
             )
             .await?;
             let origin_network = &self.pi.cfg.network;
@@ -407,10 +424,9 @@ impl OutboundConnection {
             src: remote_addr.ip(),
             dst: req.actual_destination,
         });
-        let (upgraded, baggage) = Box::pin(self.pool.send_request_pooled(&pool_key, request))
+        Box::pin(self.pool.send_request_pooled(&pool_key, request))
             .instrument(trace_span!("outbound connect"))
-            .await?;
-        Ok((upgraded, baggage))
+            .await
     }
 
     async fn proxy_to_tcp(
@@ -969,6 +985,7 @@ mod tests {
                     ports: vec![Port {
                         service_port: 80,
                         target_port: 8080,
+                        app_protocol: 0,
                     }],
                     ..Default::default()
                 }),
@@ -982,6 +999,7 @@ mod tests {
                             ports: vec![Port {
                                 service_port: 80,
                                 target_port: 8080,
+                                app_protocol: 0,
                             }],
                         },
                     )]),
@@ -1011,6 +1029,7 @@ mod tests {
                     ports: vec![Port {
                         service_port: 80,
                         target_port: 8080,
+                        app_protocol: 0,
                     }],
                     ..Default::default()
                 }),
@@ -1036,6 +1055,7 @@ mod tests {
                             ports: vec![Port {
                                 service_port: 80,
                                 target_port: 8080,
+                                app_protocol: 0,
                             }],
                         },
                     )]),
@@ -1071,6 +1091,7 @@ mod tests {
                     ports: vec![Port {
                         service_port: 80,
                         target_port: 8080,
+                        app_protocol: 0,
                     }],
                     ..Default::default()
                 }),
@@ -1084,6 +1105,7 @@ mod tests {
                     ports: vec![Port {
                         service_port: 15009,
                         target_port: 15009,
+                        app_protocol: 0,
                     }],
                     ..Default::default()
                 }),
@@ -1108,6 +1130,7 @@ mod tests {
                             ports: vec![Port {
                                 service_port: 80,
                                 target_port: 8080,
+                                app_protocol: 0,
                             }],
                         },
                     )]),
@@ -1123,6 +1146,7 @@ mod tests {
                             ports: vec![Port {
                                 service_port: 15009,
                                 target_port: 15008,
+                                app_protocol: 0,
                             }],
                         },
                     )]),
@@ -1152,6 +1176,7 @@ mod tests {
                     ports: vec![Port {
                         service_port: 80,
                         target_port: 8080,
+                        app_protocol: 0,
                     }],
                     waypoint: Some(xds::istio::workload::GatewayAddress {
                         destination: Some(
@@ -1176,6 +1201,7 @@ mod tests {
                     ports: vec![Port {
                         service_port: 15008,
                         target_port: 15008,
+                        app_protocol: 0,
                     }],
                     ..Default::default()
                 }),
@@ -1201,6 +1227,7 @@ mod tests {
                             ports: vec![Port {
                                 service_port: 15008,
                                 target_port: 15008,
+                                app_protocol: 0,
                             }],
                         },
                     )]),
@@ -1237,6 +1264,7 @@ mod tests {
             ports: vec![Port {
                 service_port: 80,
                 target_port: 8080,
+                app_protocol: 0,
             }],
             // Prefer routing to workloads on the same network, but when nothing is healthy locally
             // allow failing over to remote networks.
@@ -1275,6 +1303,7 @@ mod tests {
                     ports: vec![Port {
                         service_port: 80,
                         target_port: 8080,
+                        app_protocol: 0,
                     }],
                 },
             )]),
@@ -1291,6 +1320,7 @@ mod tests {
                     ports: vec![Port {
                         service_port: 80,
                         target_port: 8080,
+                        app_protocol: 0,
                     }],
                 },
             )]),
@@ -1308,6 +1338,7 @@ mod tests {
                     ports: vec![Port {
                         service_port: 80,
                         target_port: 8080,
+                        app_protocol: 0,
                     }],
                 },
             )]),
@@ -1551,6 +1582,7 @@ mod tests {
                 ports: vec![Port {
                     service_port: 80,
                     target_port: 8080,
+                    app_protocol: 0,
                 }],
                 waypoint: Some(xds::istio::workload::GatewayAddress {
                     destination: Some(xds::istio::workload::gateway_address::Destination::Address(
@@ -1588,6 +1620,7 @@ mod tests {
                 ports: vec![Port {
                     service_port: 80,
                     target_port: 8080,
+                    app_protocol: 0,
                 }],
                 ..Default::default()
             }),
@@ -1614,10 +1647,12 @@ mod tests {
                         Port {
                             service_port: 80,
                             target_port: 0, // named port
+                            app_protocol: 0,
                         },
                         Port {
                             service_port: 8080,
                             target_port: 0, // named port
+                            app_protocol: 0,
                         },
                     ],
                     ..Default::default()
@@ -1631,6 +1666,7 @@ mod tests {
                             ports: vec![Port {
                                 service_port: 80,
                                 target_port: 1234,
+                                app_protocol: 0,
                             }],
                         },
                     )]),
@@ -1646,6 +1682,7 @@ mod tests {
                             ports: vec![Port {
                                 service_port: 8080,
                                 target_port: 9999,
+                                app_protocol: 0,
                             }],
                         },
                     )]),
@@ -1675,6 +1712,7 @@ mod tests {
                 ports: vec![Port {
                     service_port: 80,
                     target_port: 80,
+                    app_protocol: 0,
                 }],
                 ..Default::default()
             }),
@@ -1689,6 +1727,7 @@ mod tests {
                         ports: vec![Port {
                             service_port: 80,
                             target_port: 80,
+                            app_protocol: 0,
                         }],
                     },
                 )]),
@@ -1815,6 +1854,7 @@ mod tests {
                 ports: vec![Port {
                     service_port: 80,
                     target_port: 80,
+                    app_protocol: 0,
                 }],
                 ..Default::default()
             };
@@ -1898,6 +1938,7 @@ mod tests {
                 ports: vec![Port {
                     service_port: 80,
                     target_port: 80,
+                    app_protocol: 0,
                 }],
                 ..Default::default()
             }),
@@ -1946,6 +1987,7 @@ mod tests {
                 ports: vec![Port {
                     service_port: 80,
                     target_port: 80,
+                    app_protocol: 0,
                 }],
                 ..Default::default()
             }),

@@ -199,9 +199,9 @@ impl Drop for NamespaceManager {
             return;
         };
         for (name, ns) in state.pods.iter() {
-            drop_namespace(&format!("{}~{}~{name}", self.prefix, &ns.node));
+            drop_namespace(&format!("{}~{}~{name}", self.prefix, ns.node));
         }
-        for (name, _) in state.nodes.iter() {
+        for name in state.nodes.keys() {
             drop_namespace(&format!("{}~{name}", self.prefix));
         }
     }
@@ -253,7 +253,7 @@ ip -n {prefix} addr add 172.172.0.1/16 dev br0
         // 10.0.0.1 is the node namespace, so skip 0 and 1
         assert!(state.pods.len() < 254, "only 255 networks allowed");
         let id = state.pods.len() as u8 + 2;
-        let node_net = format!("{}~{node}", &self.prefix);
+        let node_net = format!("{}~{node}", self.prefix);
         let prefix = &self.prefix;
         if state.pods.contains_key(name) {
             panic!("pod {name} already registered");
@@ -288,7 +288,7 @@ ip -n {node_net} route add 172.172.0.0/17 dev eth0 scope link src 172.172.0.{nod
                     continue;
                 }
                 let other_id = s.id;
-                let other_net = format!("{}~{node}", &self.prefix);
+                let other_net = format!("{}~{node}", self.prefix);
                 helpers::run_command(&format!(
                     "
 set -ex

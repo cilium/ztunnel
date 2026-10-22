@@ -15,9 +15,10 @@
 use crate::config;
 use crate::config::ProxyMode;
 use crate::identity::Priority::Warmup;
-use crate::identity::{CompositeId, Request, RequestKey, SecretManager};
-use crate::inpod::WorkloadUid;
+use crate::identity::{Identity, SecretManager};
+use crate::state::WorkloadInfo;
 use crate::state::workload::{InboundProtocol, Workload};
+use crate::strng::Strng;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info};
@@ -44,25 +45,38 @@ pub fn new(cfg: &config::Config, cert_manager: Arc<SecretManager>) -> Arc<dyn Ce
     }
 }
 
+/// Internal request type for the pre-fetch channel. Fetch runs at warmup
+/// priority. Forget removes the identity-keyed entry. ForgetWorkload removes
+/// the workload-keyed entry that SPIRE mode creates for each pod.
+enum PrefetchRequest {
+    Fetch(Identity),
+    Forget(Identity),
+    ForgetWorkload {
+        id: Identity,
+        uid: Strng,
+        workload: Arc<WorkloadInfo>,
+    },
+}
+
 /// A real [CertFetcher] that asynchronously forwards cert pre-fetch requests to a [SecretManager].
 struct CertFetcherImpl {
     proxy_mode: ProxyMode,
     local_node: Option<String>,
-    tx: mpsc::Sender<Request>,
-    cfg: config::Config,
+    tx: mpsc::Sender<PrefetchRequest>,
+    spire_enabled: bool,
 }
 
 impl CertFetcherImpl {
     fn new(cfg: &config::Config, cert_manager: Arc<SecretManager>) -> Self {
-        let (tx, mut rx) = mpsc::channel::<Request>(256);
+        let (tx, mut rx) = mpsc::channel::<PrefetchRequest>(256);
 
         // Spawn a task for handling the pre-fetch requests asynchronously.
         tokio::spawn(async move {
             while let Some(req) = rx.recv().await {
                 match req {
-                    Request::Fetch(workload_identity, priority) => {
+                    PrefetchRequest::Fetch(workload_identity) => {
                         match cert_manager
-                            .fetch_certificate_pri(&workload_identity, priority)
+                            .fetch_certificate_pri(&workload_identity, Warmup)
                             .await
                         {
                             Ok(_) => {
@@ -75,8 +89,13 @@ impl CertFetcherImpl {
                             ),
                         }
                     }
-                    Request::Forget(workload_identity) => {
+                    PrefetchRequest::Forget(workload_identity) => {
                         cert_manager.forget_certificate(&workload_identity).await;
+                    }
+                    PrefetchRequest::ForgetWorkload { id, uid, workload } => {
+                        cert_manager
+                            .forget_certificate_by_workload(&id, workload, uid)
+                            .await;
                     }
                 }
             }
@@ -86,7 +105,7 @@ impl CertFetcherImpl {
             proxy_mode: cfg.proxy_mode,
             local_node: cfg.local_node.clone(),
             tx,
-            cfg: cfg.clone(),
+            spire_enabled: cfg.spire_enabled,
         }
     }
 
@@ -99,36 +118,36 @@ impl CertFetcherImpl {
             // We only get certs for our own node
             Some(w.node.as_ref()) == self.local_node.as_deref() &&
             // If it doesn't support HBONE it *probably* doesn't need a cert.
-            (w.native_tunnel || w.protocol == InboundProtocol::HBONE) && !self.cfg.spire_enabled
-    }
-
-    fn build_key(&self, w: &Workload) -> CompositeId<RequestKey> {
-        if self.cfg.spire_enabled {
-            CompositeId::new(
-                w.identity(),
-                RequestKey::Workload(WorkloadUid::new(w.uid.to_string())),
-            )
-        } else {
-            CompositeId::new(w.identity(), RequestKey::Identity(w.identity().clone()))
-        }
+            (w.native_tunnel || w.protocol == InboundProtocol::HBONE) &&
+            // SPIRE attests the pod by PID, so its cert can only be fetched on demand.
+            !self.spire_enabled
     }
 }
 
 impl CertFetcher for CertFetcherImpl {
     fn prefetch_cert(&self, w: &Workload) {
-        if self.should_prefetch_certificate(w) {
-            let key = self.build_key(w);
-
-            if let Err(e) = self.tx.try_send(Request::Fetch(key, Warmup)) {
-                info!("couldn't prefetch: {:?}", e)
-            }
+        if self.should_prefetch_certificate(w)
+            && let Err(e) = self.tx.try_send(PrefetchRequest::Fetch(w.identity()))
+        {
+            info!("couldn't prefetch: {:?}", e)
         }
     }
 
     fn clear_cert(&self, w: &Workload) {
-        let key = self.build_key(w);
-
-        if let Err(e) = self.tx.try_send(Request::Forget(key)) {
+        let req = if self.spire_enabled {
+            PrefetchRequest::ForgetWorkload {
+                id: w.identity(),
+                uid: w.uid.clone(),
+                workload: Arc::new(WorkloadInfo::new(
+                    w.name.to_string(),
+                    w.namespace.to_string(),
+                    w.service_account.to_string(),
+                )),
+            }
+        } else {
+            PrefetchRequest::Forget(w.identity())
+        };
+        if let Err(e) = self.tx.try_send(req) {
             info!("couldn't clear identity: {:?}", e)
         }
     }

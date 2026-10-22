@@ -22,7 +22,6 @@ use std::{fmt, io};
 
 use hickory_proto::ProtoError;
 
-use crate::inpod::WorkloadUid;
 use crate::strng::Strng;
 use rand::Rng;
 use socket2::TcpKeepalive;
@@ -33,7 +32,7 @@ use tracing::{Instrument, debug, trace, warn};
 use inbound::Inbound;
 pub use metrics::*;
 
-use crate::identity::{CompositeId, Identity, RequestKey, SecretManager};
+use crate::identity::{Identity, SecretManager};
 
 use crate::dns::resolver::Resolver;
 use crate::drain::DrainWatcher;
@@ -52,6 +51,7 @@ pub mod connection_manager;
 pub mod inbound;
 
 mod h2;
+pub(crate) use h2::TeardownCause;
 mod inbound_passthrough;
 #[allow(non_camel_case_types)]
 pub mod metrics;
@@ -213,17 +213,14 @@ impl LocalWorkloadInformation {
             namespace: (&self.wi.namespace).into(),
             service_account: (&self.wi.service_account).into(),
         };
-
-        let key = if self.cfg.spire_enabled {
-            CompositeId::new(
-                id.clone(),
-                RequestKey::Workload(WorkloadUid::new(wl.uid.to_string())),
-            )
+        if self.cfg.spire_enabled {
+            // SPIRE attests each pod by PID, so the cache entry is keyed by workload.
+            self.full_cert_manager
+                .fetch_certificate_by_workload(id, self.wi.clone(), wl.uid.clone())
+                .await
         } else {
-            CompositeId::new(id.clone(), RequestKey::Identity(wl.identity().clone()))
-        };
-
-        self.full_cert_manager.fetch_certificate(&key).await
+            self.full_cert_manager.fetch_certificate(id).await
+        }
     }
 
     pub fn workload_info(&self) -> Arc<WorkloadInfo> {
@@ -426,6 +423,9 @@ pub enum Error {
     #[error("connection closed due to policy change")]
     AuthorizationPolicyLateRejection,
 
+    #[error("connection closed: {0}")]
+    Teardown(#[from] h2::Teardown),
+
     #[error("connection closed due to policy rejection: {0}")]
     AuthorizationPolicyRejection(AuthorizationRejectionError),
 
@@ -529,6 +529,14 @@ pub enum Error {
     DnsLookup(#[from] hickory_server::zone_handler::LookupError),
     #[error("dns response had no valid IP addresses")]
     DnsEmpty,
+}
+
+impl Error {
+    /// The HBONE teardown that caused an aborted transport `e`, if any.
+    pub(crate) fn from_teardown(e: &io::Error) -> Option<Error> {
+        let teardown = e.get_ref()?.downcast_ref::<h2::Teardown>()?;
+        Some(Error::Teardown(teardown.clone()))
+    }
 }
 
 // Custom TLV for proxy protocol for the identity of the source

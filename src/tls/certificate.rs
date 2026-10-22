@@ -21,12 +21,11 @@ use std::{cmp, iter};
 use x509_parser::asn1_rs::FromDer;
 
 use rustls::client::Resumption;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::pki_types::pem::{PemObject, SectionKind};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
 use rustls::server::WebPkiClientVerifier;
 use rustls::{ClientConfig, CommonState, RootCertStore, ServerConfig};
-use rustls_pemfile::Item;
-use std::io::Cursor;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -34,6 +33,7 @@ use tracing::warn;
 
 use crate::tls;
 use x509_parser::certificate::X509Certificate;
+use x509_parser::error::X509Result;
 
 #[derive(Clone, Debug)]
 pub struct Certificate {
@@ -61,18 +61,20 @@ pub struct WorkloadCertificate {
     pub roots: Vec<Certificate>,
 }
 
-pub fn identity_from_connection(conn: &CommonState) -> Option<Identity> {
+pub fn certificate_from_connection(conn: &CommonState) -> X509Result<'_, X509Certificate<'_>> {
     use x509_parser::prelude::*;
     conn.peer_certificates()
         .and_then(|certs| certs.first())
-        .and_then(|cert| match X509Certificate::from_der(cert) {
-            Ok((_, a)) => Some(a),
-            Err(e) => {
-                warn!("invalid certificate: {e}");
-                None
-            }
+        .ok_or(X509Error::InvalidCertificate.into())
+        .and_then(|cert| {
+            X509Certificate::from_der(cert).inspect_err(|e| warn!("invalid certificate: {e}"))
         })
-        .and_then(|cert| match identities(cert) {
+}
+
+pub fn identity(result: &X509Result<X509Certificate>) -> Option<Identity> {
+    result
+        .as_ref()
+        .map_or(None, |(_, cert)| match identities(cert) {
             Ok(ids) => ids.into_iter().next(),
             Err(e) => {
                 warn!("failed to extract identity: {}", e);
@@ -81,7 +83,7 @@ pub fn identity_from_connection(conn: &CommonState) -> Option<Identity> {
         })
 }
 
-pub fn identities(cert: X509Certificate) -> Result<Vec<Identity>, Error> {
+pub fn identities(cert: &X509Certificate) -> Result<Vec<Identity>, Error> {
     use x509_parser::prelude::*;
     let names = cert
         .subject_alternative_name()?
@@ -197,50 +199,38 @@ fn expiration(cert: X509Certificate) -> Expiration {
     }
 }
 
-pub fn parse_cert(mut cert: Vec<u8>) -> Result<Certificate, Error> {
-    let mut reader = std::io::BufReader::new(Cursor::new(&mut cert));
-    let parsed = rustls_pemfile::read_one(&mut reader)
-        .map_err(|e| Error::CertificateParseError(e.to_string()))?
-        .ok_or_else(|| Error::CertificateParseError("no certificate".to_string()))?;
-    let Item::X509Certificate(der) = parsed else {
-        return Err(Error::CertificateParseError("no certificate".to_string()));
-    };
-
-    let (_, cert) = x509_parser::parse_x509_certificate(&der)?;
-    Ok(Certificate {
-        der: der.clone(),
-        expiry: expiration(cert),
-    })
+pub fn parse_cert(cert: Vec<u8>) -> Result<Certificate, Error> {
+    let der = CertificateDer::from_pem_slice(&cert)
+        .map_err(|e| Error::CertificateParseError(format!("no certificate: {e}")))?;
+    let (_, parsed) = x509_parser::parse_x509_certificate(&der)?;
+    let expiry = expiration(parsed);
+    Ok(Certificate { der, expiry })
 }
 
-fn parse_cert_multi(mut cert: &[u8]) -> Result<Vec<Certificate>, Error> {
-    let mut reader = std::io::BufReader::new(Cursor::new(&mut cert));
-    let parsed: Result<Vec<_>, _> = rustls_pemfile::read_all(&mut reader).collect();
-    parsed
-        .map_err(|e| Error::CertificateParseError(e.to_string()))?
-        .into_iter()
+fn parse_cert_multi(cert: &[u8]) -> Result<Vec<Certificate>, Error> {
+    // Iterate over all recognised sections (not just certificates) so that unexpected content,
+    // such as a private key in a root bundle, is rejected rather than silently skipped.
+    <(SectionKind, Vec<u8>)>::pem_slice_iter(cert)
         .map(|p| {
-            let Item::X509Certificate(der) = p else {
-                return Err(Error::CertificateParseError("no certificate".to_string()));
-            };
-            let (_, cert) = x509_parser::parse_x509_certificate(&der)?;
-            Ok(Certificate {
-                der: der.clone(),
-                expiry: expiration(cert),
-            })
+            let (kind, der) =
+                p.map_err(|e| Error::CertificateParseError(format!("invalid certificate: {e}")))?;
+            if kind != SectionKind::Certificate {
+                return Err(Error::CertificateParseError(format!(
+                    "unexpected PEM section in certificate bundle: {kind:?}"
+                )));
+            }
+            let der = CertificateDer::from(der);
+            let (_, parsed) = x509_parser::parse_x509_certificate(&der)?;
+            let expiry = expiration(parsed);
+            Ok(Certificate { der, expiry })
         })
         .collect()
 }
 
-fn parse_key(mut key: &[u8]) -> Result<PrivateKeyDer<'static>, Error> {
-    let mut reader = std::io::BufReader::new(Cursor::new(&mut key));
-    let parsed = rustls_pemfile::read_one(&mut reader)
-        .map_err(|e| Error::CertificateParseError(e.to_string()))?
-        .ok_or_else(|| Error::CertificateParseError("no key".to_string()))?;
-    match parsed {
-        Item::Pkcs8Key(c) => Ok(PrivateKeyDer::Pkcs8(c)),
-        _ => Err(Error::CertificateParseError("no key".to_string())),
-    }
+fn parse_key(key: &[u8]) -> Result<PrivateKeyDer<'static>, Error> {
+    PrivatePkcs8KeyDer::from_pem_slice(key)
+        .map(PrivateKeyDer::Pkcs8)
+        .map_err(|e| Error::CertificateParseError(format!("no PKCS#8 private key: {e}")))
 }
 
 impl WorkloadCertificate {
@@ -335,6 +325,13 @@ impl WorkloadCertificate {
         self.cert.identity()
     }
 
+    /// The trust anchors this certificate chains to. Used to re-run the shared webpki
+    /// chain-validation path ([`crate::tls::revocation::verify_cert_chain`]) against a peer chain
+    /// captured at handshake time, e.g. to re-check CRL revocation on an existing connection.
+    pub fn root_store(&self) -> Arc<RootCertStore> {
+        self.root_store.clone()
+    }
+
     // TODO: can we precompute some or all of this?
 
     pub(in crate::tls) fn cert_and_intermediates_der(&self) -> Vec<CertificateDer<'static>> {
@@ -375,7 +372,9 @@ impl WorkloadCertificate {
         if let Some(ref mgr) = crl_manager {
             let crls = mgr.get_crl_ders();
             if !crls.is_empty() {
-                builder = builder.with_crls(crls).allow_unknown_revocation_status(); // fail-open for unknown status
+                builder = builder
+                    .with_crls(crls.iter().cloned())
+                    .allow_unknown_revocation_status(); // fail-open for unknown status
             }
         }
 
@@ -508,6 +507,100 @@ mod test {
     use tokio::net::TcpStream;
     use tokio_rustls::TlsAcceptor;
 
+    use super::{parse_cert, parse_cert_multi, parse_key};
+
+    fn parse_err(r: Result<impl std::fmt::Debug, crate::tls::Error>) -> String {
+        match r.unwrap_err() {
+            crate::tls::Error::CertificateParseError(s) => s,
+            e => panic!("unexpected error variant: {e:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_cert_empty() {
+        let e = parse_err(parse_cert(vec![]));
+        assert!(
+            e.starts_with("no certificate:") && e.contains("no items found"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn parse_cert_key_only() {
+        let (key, _) = crate::tls::mock::generate_test_certs_with_root(
+            &TestIdentity::Identity(Identity::from_str("spiffe://td/ns/n/sa/a").unwrap()),
+            SystemTime::now(),
+            SystemTime::now() + Duration::from_secs(60),
+            None,
+            TEST_ROOT_KEY,
+        );
+        let e = parse_err(parse_cert(key.into_bytes()));
+        assert!(e.contains("no items found"), "{e}");
+    }
+
+    #[test]
+    fn parse_cert_truncated() {
+        let truncated = &TEST_ROOT[..TEST_ROOT.len() / 2];
+        let e = parse_err(parse_cert(truncated.to_vec()));
+        assert!(e.starts_with("no certificate:"), "{e}");
+    }
+
+    #[test]
+    fn parse_cert_multi_empty_and_truncated() {
+        assert!(parse_cert_multi(b"").unwrap().is_empty());
+        let e = parse_err(parse_cert_multi(&TEST_ROOT[..TEST_ROOT.len() / 2]));
+        assert!(e.starts_with("invalid certificate:"), "{e}");
+    }
+
+    #[test]
+    fn parse_cert_multi_rejects_non_cert_sections() {
+        let (key, _) = crate::tls::mock::generate_test_certs_with_root(
+            &TestIdentity::Identity(Identity::from_str("spiffe://td/ns/n/sa/a").unwrap()),
+            SystemTime::now(),
+            SystemTime::now() + Duration::from_secs(60),
+            None,
+            TEST_ROOT_KEY,
+        );
+        let mut bundle = TEST_ROOT.to_vec();
+        bundle.push(b'\n');
+        bundle.extend(key.as_bytes());
+        let e = parse_err(parse_cert_multi(&bundle));
+        assert!(e.contains("unexpected PEM section"), "{e}");
+        // Multiple certificates are still fine.
+        let mut ok = TEST_ROOT.to_vec();
+        ok.push(b'\n');
+        ok.extend(TEST_ROOT2);
+        assert_eq!(parse_cert_multi(&ok).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn parse_key_errors() {
+        let e = parse_err(parse_key(b""));
+        assert!(
+            e.starts_with("no PKCS#8 private key:") && e.contains("no items found"),
+            "{e}"
+        );
+        // A certificate is not a key.
+        let e = parse_err(parse_key(TEST_ROOT));
+        assert!(e.contains("no items found"), "{e}");
+        // RSA (non-PKCS#8) keys are not accepted.
+        let rsa = b"-----BEGIN RSA PRIVATE KEY-----\nAAAA\n-----END RSA PRIVATE KEY-----\n";
+        let e = parse_err(parse_key(rsa));
+        assert!(e.contains("no items found"), "{e}");
+    }
+
+    #[test]
+    fn parse_key_ok() {
+        let (key, _) = crate::tls::mock::generate_test_certs_with_root(
+            &TestIdentity::Identity(Identity::from_str("spiffe://td/ns/n/sa/a").unwrap()),
+            SystemTime::now(),
+            SystemTime::now() + Duration::from_secs(60),
+            None,
+            TEST_ROOT_KEY,
+        );
+        assert!(parse_key(key.as_bytes()).is_ok());
+    }
+
     #[tokio::test]
     async fn multi_root() {
         helpers::initialize_telemetry();
@@ -605,8 +698,13 @@ mod test {
         crl_file.flush().unwrap();
 
         // Create CRL manager to load the CRL from file path
-        let crl_mgr =
-            Arc::new(crate::tls::crl::CrlManager::new(crl_file.path().to_path_buf()).unwrap());
+        let crl_mgr = Arc::new(
+            crate::tls::crl::CrlManager::new(
+                crl_file.path().to_path_buf(),
+                crate::test_helpers::helpers::test_proxy_metrics(),
+            )
+            .unwrap(),
+        );
 
         // Create TLS server to listen for incoming connections
         let server_tls = TlsAcceptor::from(Arc::new(server_wl.server_config(None).unwrap()));
@@ -677,8 +775,13 @@ mod test {
         crl_file.write_all(crl_pem.as_bytes()).unwrap();
         crl_file.flush().unwrap();
 
-        let crl_mgr =
-            Arc::new(crate::tls::crl::CrlManager::new(crl_file.path().to_path_buf()).unwrap());
+        let crl_mgr = Arc::new(
+            crate::tls::crl::CrlManager::new(
+                crl_file.path().to_path_buf(),
+                crate::test_helpers::helpers::test_proxy_metrics(),
+            )
+            .unwrap(),
+        );
 
         let server_tls = TlsAcceptor::from(Arc::new(server_wl.server_config(None).unwrap()));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
