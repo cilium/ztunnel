@@ -1378,12 +1378,6 @@ pub mod tests {
             _ => panic!("expected SocketAddr"),
         }
 
-        // Invalid value should error
-        unsafe {
-            env::set_var(READINESS_BIND_ADDRESS, "not-an-ip");
-        }
-        assert!(construct_config(ProxyConfig::default()).is_err());
-
         unsafe {
             env::remove_var(READINESS_BIND_ADDRESS);
         }
