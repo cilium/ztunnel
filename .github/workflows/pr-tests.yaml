@@ -75,5 +75,10 @@ jobs:
       - name: Build
         run: cargo build
 
+      # sudo-rs (the ubuntu-26.04 default) ignores -E and sets HOME=/root, so
+      # rustup finds no toolchain. Pass the job environment through env instead.
       - name: Run Tests
-        run: sudo -E env "PATH=$PATH" cargo test --benches --tests --bins
+        run: >-
+          sudo env "PATH=$PATH" "HOME=$HOME" "CARGO_INCREMENTAL=$CARGO_INCREMENTAL"
+          "CARGO_TERM_COLOR=$CARGO_TERM_COLOR" "RUST_BACKTRACE=$RUST_BACKTRACE"
+          cargo test --benches --tests --bins
