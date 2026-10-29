@@ -78,6 +78,15 @@ jobs:
           sparse-checkout: |
             install
 
+      # The ubuntu-26.04 runner boots with the kernel default of 128 inotify
+      # instances, which kind pods exhaust (EMFILE). Restore the limits the
+      # ubuntu-24.04 image set:
+      # https://kind.sigs.k8s.io/docs/user/known-issues/#pod-errors-due-to-too-many-open-files
+      - name: Raise inotify limits for kind
+        run: |
+          sysctl fs.inotify.max_user_instances fs.inotify.max_user_watches
+          sudo sysctl -w fs.inotify.max_user_instances=1280 fs.inotify.max_user_watches=655360
+
       - name: Create kind cluster
         uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1.14.0
         with:
